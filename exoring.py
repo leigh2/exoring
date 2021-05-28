@@ -2,7 +2,6 @@
 
 import numpy as np
 from numba import njit
-import numba as nb
 
 __version__ = "0.1"
 

@@ -106,11 +106,13 @@ def build_exoring_image(
 
     # initialise the output arrays
     er_image = np.zeros((2 * ngrid_maj, 2 * ngrid_min), dtype=np.float64).T
+    # meshgrid was marginally faster than mgrid in the scenarios tested
     xgrid, ygrid = np.meshgrid(
-        (np.arange(-ngrid_maj, ngrid_maj) + 0.5)/pixel_scale,
-        (np.arange(-ngrid_min, ngrid_min) + 0.5)/pixel_scale
+        (np.arange(-ngrid_maj, ngrid_maj) + 0.5) / pixel_scale,
+        (np.arange(-ngrid_min, ngrid_min) + 0.5) / pixel_scale
     )
 
+    # fill the opacity image
     er_image = fill_opacity_grid(
         xgrid, ygrid, er_image, gamma,
         inner_ring_radius, outer_ring_radius, ring_opacity,
@@ -118,15 +120,20 @@ def build_exoring_image(
     )
 
     # calculate area of each grid element, units of r_planet^2
-    elem_area = (1.0 / pixel_scale) ** 2
+    elem_area = np.float64(pixel_scale) ** -2
 
-    return er_image, xgrid, ygrid, elem_area
+    # return the full image or nonzero values as requested
+    if full_output:
+        return er_image, xgrid, ygrid, elem_area
+    else:
+        ret = er_image > 0.0
+        return er_image[ret], xgrid[ret], ygrid[ret], elem_area
 
 
 @njit
 def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
     """
-    Fill an opacity grid image with planet and ring.
+    Fill an opacity grid image with a planet and ring.
 
     Parameters
     ----------
@@ -151,79 +158,102 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
     -------
     filled opacity grid image
     """
-    # require some array shape information
+    # obtain some array shape information
     isize, jsize = image.shape
     ihalf = isize // 2
     jhalf = jsize // 2
+
     # the pixel size in planetary radii (assuming square pixels)
-    pixsize = np.float_(xgrid[0,1] - xgrid[0,0])
+    pixsize = np.float_(xgrid[0, 1] - xgrid[0, 0])
     half_pixsize = pixsize * 0.5
+
+    # super-sample spacing
+    fssf = np.float64(ssf)
+    ss_gap = pixsize / fssf
+    # super sample pixel contribution
+    ss_cont = fssf ** -2
 
     # the minor axis sized of the inner and outer ring ellipses
     i_r_min = np.sin(gamma) * i_r
     o_r_min = np.sin(gamma) * o_r
 
-    # for each pixel
+    # for each pixel of a single quadrant
     for i in range(ihalf):
         for j in range(jhalf):
             # get the position of the centre of the pixel
-            xpos = xgrid[ihalf+i, jhalf+j]
-            ypos = ygrid[ihalf+i, jhalf+j]
+            xpos = xgrid[ihalf + i, jhalf + j]
+            ypos = ygrid[ihalf + i, jhalf + j]
 
+            # positions of the vertices of the pixel
+            x_i = xpos - half_pixsize  # x inner
+            x_o = xpos + half_pixsize  # x outer
+            y_i = ypos - half_pixsize  # y inner
+            y_o = ypos + half_pixsize  # y outer
             # pixel outer radius
-            px_outer_rad = np.sqrt(
-                (xpos + half_pixsize)**2 + (ypos + half_pixsize)**2
-            )
+            px_outer_rad = np.sqrt(x_o ** 2 + y_o ** 2)
             # pixel inner radius
-            px_inner_rad = np.sqrt(
-                (xpos - half_pixsize)**2 + (ypos - half_pixsize)**2
-            )
+            px_inner_rad = np.sqrt(x_i ** 2 + y_i ** 2)
 
             if px_outer_rad <= 1.0:
-                # the radius of the furthest vertex of the pixel is inside the
+                # The radius of the furthest vertex of the pixel is inside the
                 # planet radius, hence the pixel is fully inside the planet and
-                # the opacity is total
+                # the opacity is total.
                 value = 1.0
 
-            elif (((xpos - half_pixsize) / i_r)**2 +
-                  ((ypos - half_pixsize) / i_r_min)**2 >= 1
-                  and
-                  ((xpos + half_pixsize) / o_r)**2 +
-                  ((ypos + half_pixsize) / o_r_min)**2 <= 1):
-                # the radius of the closest vertex of the pixel is outside the
+            elif (px_inner_rad >= 1.0 and
+                  ((x_i / i_r) ** 2 + (y_i / i_r_min) ** 2 >= 1 and
+                   (x_o / o_r) ** 2 + (y_o / o_r_min) ** 2 <= 1
+                  )):
+                # The radius of the closest vertex of the pixel is outside the
                 # inner radius of the ring, and the radius of its furthest
-                # vertex is inside the outer radius of the ring. Hence, the
-                # pixel is fully inside the ring. and its opacity is that of
-                # the ring.
+                # vertex is inside the outer radius of the ring. The inner
+                # vertex of the pixel is also outside the planet, Hence the
+                # pixel is fully inside the ring but also fully outside the
+                # planet and its opacity is that of the ring.
                 value = op
 
             elif (px_inner_rad >= 1.0 and
-                (((xpos + half_pixsize) / i_r) ** 2 +
-                 ((ypos + half_pixsize) / i_r_min) ** 2 <= 1
-                 or
-                 ((xpos - half_pixsize) / o_r) ** 2 +
-                 ((ypos - half_pixsize) / o_r_min) ** 2 >= 1)):
-                # the pixel is wholly outside the planet and its ring so the
-                # opacity is zero
+                  ((x_o / i_r) ** 2 + (y_o / i_r_min) ** 2 <= 1 or
+                   (x_i / o_r) ** 2 + (y_i / o_r_min) ** 2 >= 1
+                  )):
+                # The inner vertex of the pixel is outside the planet.
+                # Additionally, the outer vertex of the  pixels is closer than
+                # the inner edge of the ring, or the inner vertex is further
+                # than the outer edge of the ring. This means the pixel is
+                # wholly outside the planet and the ring, hence its opacity
+                # value is zero.
                 value = 0.0
 
             else:
-                # the pixel is partially covered by the planet and/or ring and
-                # so we super-sample the pixel to estimate the opacity of the pixel
-                value = -1
-                # TODO finish from here
+                # The pixel is partially covered by the planet and/or ring and
+                # so we must super-sample the pixel to estimate the appropriate
+                # opacity value for the pixel.
+                value = 0.0
+                for m in range(ssf):
+                    for n in range(ssf):
+                        # central position of super sample pixel
+                        _xp = x_i + (0.5 + m) * ss_gap
+                        _yp = y_i + (0.5 + n) * ss_gap
 
+                        if np.sqrt(_xp ** 2 + _yp ** 2) < 1.0:
+                            # the super sample pixel centre is on the planet
+                            value = value + ss_cont
+
+                        elif (
+                                (_xp / i_r) ** 2 + (_yp / i_r_min) ** 2 >= 1 and
+                                (_xp / o_r) ** 2 + (_yp / o_r_min) ** 2 < 1
+                        ):
+                            # the super sample pixel centre is on the ring
+                            value = value + op * ss_cont
 
             # send the value to the four relevant places in the image
-            image[ihalf+i, jhalf+j] = \
-                image[ihalf-i-1, jhalf+j] = \
-                image[ihalf+i, jhalf-j-1] = \
-                image[ihalf-i-1, jhalf-j-1] = \
+            image[ihalf + i, jhalf + j] = \
+                image[ihalf - i - 1, jhalf + j] = \
+                image[ihalf + i, jhalf - j - 1] = \
+                image[ihalf - i - 1, jhalf - j - 1] = \
                 value
 
-
     return image
-
 
 
 if __name__ == "__main__":
@@ -239,56 +269,20 @@ if __name__ == "__main__":
     else:
         print("failed")
 
-    import matplotlib.pyplot as plt
-    from time import time
-
-    #_ = build_exoring_image(10, 1.0, 1.0, 1.0, 1.0)
-    _ = build_exoring_image(100, 1.0, 1.0, 1.0, 1.0)
-    t0 = time()
-    img = build_exoring_image(
-        100,
-        2,
-        2.5,
-        0.5,
-        0.1,
-        super_sample_factor=10,
-        full_output=True,
+    print("opacity image generation...", end=' ')
+    oig_test_data = np.load("tests/opacity_image_gen_test_data.npz")
+    img, xgrid, ygrid, px_area = build_exoring_image(
+        int(oig_test_data['ngrid']),
+        *oig_test_data['params'],
+        super_sample_factor=int(oig_test_data['super_sample_factor']),
+        full_output=oig_test_data['full_output']
     )
-    print("ex time:", (time() - t0) * 1000.)
-    t0 = time()
-    img = build_exoring_image(
-        100,
-        2.1,
-        2.5,
-        0.5,
-        0.1,
-        super_sample_factor=10,
-        full_output=True,
-    )
-    print("ex time:", (time() - t0) * 1000.)
-
-    plt.imshow(1-img[0])
-    plt.colorbar()
-
-    '''fig, axes = plt.subplots(ncols=3, nrows=1, figsize=(18, 4))
-    for i in range(3):
-        cmap = None if i==0 else 'bwr'
-        im = axes[i].imshow(img[i], origin="lower", cmap=cmap)
-        plt.colorbar(im, ax=axes[i])'''
-
-    '''from ringed_planet_transit import build_ringed_occulter
-
-    t0 = time()
-    im2, x2, y2, a2 = build_ringed_occulter(rings=[(2.0, 2.5, 0.5)], gamma=0.1,
-                                            full_output=True)
-    print((time() - t0) * 1000.)
-
-    fig2, axes2 = plt.subplots(ncols=3, nrows=1, figsize=(18, 4))
-    img2 = [im2, x2, y2]
-    for i in range(3):
-        cmap = None if i==0 else 'bwr'
-        im = axes2[i].imshow(img2[i], origin="lower", cmap=cmap)
-        plt.colorbar(im, ax=axes2[i])
-    '''
-
-    plt.show()
+    if (
+            all((img - oig_test_data['op_img']).flatten() == 0) and
+            all((xgrid - oig_test_data['op_xgrid']).flatten() == 0) and
+            all((ygrid - oig_test_data['op_ygrid']).flatten() == 0) and
+            px_area == oig_test_data['op_area']
+    ):
+        print("passed")
+    else:
+        print("failed")

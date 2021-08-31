@@ -2,6 +2,7 @@
 
 import numpy as np
 from numba import njit
+import warnings
 
 __version__ = "0.1"
 
@@ -24,7 +25,7 @@ def quad_limb_dark(radii, a, b):
 
     Todo
     ----
-    Check the provided limb darkening coefficients are valid.
+    Check that the provided limb darkening coefficients are valid.
     """
 
     # initialise intensity map
@@ -52,6 +53,7 @@ def build_exoring_image(
         full_output=False,
 ):
     """
+    Build an exoplanet + ring opacity mask.
 
     Parameters
     ----------
@@ -94,6 +96,13 @@ def build_exoring_image(
         The area of each transparency profile element in units of planetary
         radii squared.
     """
+
+    # check inputs
+    if inner_ring_radius >= outer_ring_radius:
+        warnings.warn("inner ring radius >= outer ring radius, values swapped "
+                      "so they make logical sense")
+        inner_ring_radius, outer_ring_radius = \
+            outer_ring_radius, inner_ring_radius
 
     # get the half size of the required grid in each dimension
     ngrid_maj = max(
@@ -238,10 +247,8 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                             # the super sample pixel centre is on the planet
                             value = value + ss_cont
 
-                        elif (
-                                (_xp / i_r) ** 2 + (_yp / i_r_min) ** 2 >= 1 and
-                                (_xp / o_r) ** 2 + (_yp / o_r_min) ** 2 < 1
-                        ):
+                        elif ((_xp / i_r) ** 2 + (_yp / i_r_min) ** 2 >= 1 and
+                              (_xp / o_r) ** 2 + (_yp / o_r_min) ** 2 < 1):
                             # the super sample pixel centre is on the ring
                             value = value + op * ss_cont
 
@@ -253,6 +260,90 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                 value
 
     return image
+
+
+def occult_star(img,
+                xgrid,
+                ygrid,
+                px_area,
+                planet_radius,
+                offset_x,
+                offset_y,
+                obliquity,
+                ld_params):
+    # scale the transparency mask size
+    _xgrid, _ygrid = map(lambda _a: _a * planet_radius, [xgrid, ygrid])
+    # scale the transparency mask element area
+    _px_area = px_area * planet_radius ** 2
+
+    # rotate the transparency mask by the obliquity
+    c_oblq, s_oblq = np.cos(obliquity), np.sin(obliquity)
+    _xgrid = _xgrid * c_oblq - _ygrid * s_oblq
+    _ygrid = _xgrid * s_oblq + _ygrid * c_oblq
+
+    # apply the positional offsets
+    _ygrid += offset_y
+    _xgrid = _xgrid + offset_x[:, None]
+
+    # where no occultation occurs return an array of ones
+    if np.min(np.sqrt(_xgrid ** 2 + _ygrid ** 2)) > 1.0:
+        return np.ones(offset_x.size, dtype=np.float64)
+
+    # evaluate stellar flux at the positions
+    I = quad_limb_dark(np.sqrt(_xgrid ** 2 + _ygrid ** 2),
+                       *ld_params) * _px_area
+
+    # return the flux relative to baseline
+    return 1 + (np.sum(I * (1.0 - img)[None, :], axis=1) - np.sum(I, axis=1))
+
+
+@njit
+def occult_star_jit(
+        lc,
+        img,
+        xgrid,
+        ygrid,
+        px_area,
+        planet_radius,
+        offset_x,
+        offset_y,
+        obliquity,
+        ld_params
+):
+    # check inputs
+    assert lc.shape == offset_x.shape
+    assert img.shape == xgrid.shape
+    assert img.shape == ygrid.shape
+
+    # scale the opacity mask size
+    _xgrid = xgrid * planet_radius
+    _ygrid = ygrid * planet_radius
+    # scale the opacity mask element area
+    _px_area = px_area * planet_radius ** 2
+
+    # rotate the opacity mask by the obliquity
+    c_oblq, s_oblq = np.cos(obliquity), np.sin(obliquity)
+    _xgrid = _xgrid * c_oblq - _ygrid * s_oblq
+    _ygrid = _xgrid * s_oblq + _ygrid * c_oblq
+
+    # apply the y direction positional offset
+    _ygrid += offset_y
+
+    # now for each x offset position
+    for i in range(offset_x.size):
+        _xg = _xgrid + offset_x[i]
+
+        # radius of each pixel
+        px_rad = np.sqrt(_xg ** 2 + _ygrid ** 2)
+
+        if np.min(px_rad) <= 1.0:
+            # compute the obscured flux of the star if an occultation occurs
+            px_flux = quad_limb_dark(px_rad, *ld_params) * _px_area
+
+            # subtract this flux from the light curve point
+            lc[i] = lc[i] - np.sum(img * px_flux)
+
+    return lc
 
 
 if __name__ == "__main__":
@@ -282,6 +373,23 @@ if __name__ == "__main__":
             all((ygrid - oig_test_data['op_ygrid']).flatten() == 0) and
             px_area == oig_test_data['op_area']
     ):
+        print("passed")
+    else:
+        print("failed")
+
+    print("transit light curve generation...", end=' ')
+    test_threshold = 1E-12
+    lc_test_data = np.load('tests/transit_lc_gen_test_data.npz')
+    base_lc = np.ones_like(lc_test_data['lc_x_steps'], dtype=np.float64)
+    lc = occult_star_jit(
+        base_lc, lc_test_data['lc_img'],
+        lc_test_data['lc_xgrid'], lc_test_data['lc_ygrid'],
+        lc_test_data['lc_px_area'], lc_test_data['lc_p_rad'],
+        lc_test_data['lc_x_steps'], lc_test_data['lc_y_offset'],
+        lc_test_data['lc_obliq'], tuple(lc_test_data['lc_ld_params'])
+    )
+    diffs = np.abs(lc - lc_test_data['lc_result']).flatten()
+    if all(diffs < test_threshold):
         print("passed")
     else:
         print("failed")

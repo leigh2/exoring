@@ -262,41 +262,6 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
     return image
 
 
-def occult_star(img,
-                xgrid,
-                ygrid,
-                px_area,
-                planet_radius,
-                offset_x,
-                offset_y,
-                obliquity,
-                ld_params):
-    # scale the transparency mask size
-    _xgrid, _ygrid = map(lambda _a: _a * planet_radius, [xgrid, ygrid])
-    # scale the transparency mask element area
-    _px_area = px_area * planet_radius ** 2
-
-    # rotate the transparency mask by the obliquity
-    c_oblq, s_oblq = np.cos(obliquity), np.sin(obliquity)
-    _xgrid = _xgrid * c_oblq - _ygrid * s_oblq
-    _ygrid = _xgrid * s_oblq + _ygrid * c_oblq
-
-    # apply the positional offsets
-    _ygrid += offset_y
-    _xgrid = _xgrid + offset_x[:, None]
-
-    # where no occultation occurs return an array of ones
-    if np.min(np.sqrt(_xgrid ** 2 + _ygrid ** 2)) > 1.0:
-        return np.ones(offset_x.size, dtype=np.float64)
-
-    # evaluate stellar flux at the positions
-    I = quad_limb_dark(np.sqrt(_xgrid ** 2 + _ygrid ** 2),
-                       *ld_params) * _px_area
-
-    # return the flux relative to baseline
-    return 1 + (np.sum(I * (1.0 - img)[None, :], axis=1) - np.sum(I, axis=1))
-
-
 @njit
 def occult_star_jit(
         lc,
@@ -310,6 +275,37 @@ def occult_star_jit(
         obliquity,
         ld_params
 ):
+    """
+
+    Parameters
+    ----------
+    lc : ndarray
+        shape (N,) numpy array to fill with the light curve data
+    img : ndarray
+        image array
+    xgrid : ndarray
+        x grid coordinates of the image array
+    ygrid : ndarray
+        y grid coordinates of the image array
+    px_area : float
+        the area of each image grid element
+    planet_radius : float
+        the radius of the planet relative to the radius of the star
+    offset_x : ndarray
+        shape (N,) numpy array containing x offset positions of the planet at
+        the desired times
+    offset_y : float
+        the constant offset position in the y direction
+    obliquity : float
+        the angle of the planet relative to its direction of motion in radians
+    ld_params : tuple
+        length 2 tuple of quadratic limb darkening parameters
+
+    Returns
+    -------
+    lc : ndarray
+        shape (N,) numpy array of the light curve data points
+    """
     # check inputs
     assert lc.shape == offset_x.shape
     assert img.shape == xgrid.shape

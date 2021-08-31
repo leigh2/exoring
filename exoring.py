@@ -263,7 +263,7 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
 
 
 @njit
-def occult_star_jit(
+def occult_star(
         lc,
         img,
         xgrid,
@@ -377,7 +377,7 @@ if __name__ == "__main__":
     test_threshold = 1E-12
     lc_test_data = np.load('tests/transit_lc_gen_test_data.npz')
     base_lc = np.ones_like(lc_test_data['lc_x_steps'], dtype=np.float64)
-    lc = occult_star_jit(
+    lc = occult_star(
         base_lc, lc_test_data['lc_img'],
         lc_test_data['lc_xgrid'], lc_test_data['lc_ygrid'],
         lc_test_data['lc_px_area'], lc_test_data['lc_p_rad'],

@@ -22,11 +22,16 @@ def quad_limb_dark(radii, a, b):
     -------
     intensity : ndarray
         Stellar intensity at the requested radii.
-
-    Todo
-    ----
-    Check that the provided limb darkening coefficients are valid.
     """
+
+    #todo
+    # get this running in numba, then will have to update tests as testing ld
+    # parameters used are invalid by this prescription
+    '''# warn if the limb darkening coefficients are invalid
+    # Kipping, D.M. 2013MNRAS.435.2152K eqn.8
+    valid_ld_params = (a + b) < 1 and a > 0 and (a + 2*b) > 0
+    if not valid_ld_params:
+        warnings.warn("limb darkening parameters may be invalid")'''
 
     # initialise intensity map
     intensity = np.zeros(radii.shape, dtype=np.float64)

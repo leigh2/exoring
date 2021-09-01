@@ -269,8 +269,69 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
     return image
 
 
-@njit
 def occult_star(
+        img,
+        xgrid,
+        ygrid,
+        px_area,
+        planet_radius,
+        offset_x,
+        offset_y,
+        obliquity,
+        ld_params
+):
+    """
+    Occult a star by the transparency image, producint a light curve.
+
+    Parameters
+    ----------
+    img : ndarray
+        image array
+    xgrid : ndarray
+        x grid coordinates of the image array
+    ygrid : ndarray
+        y grid coordinates of the image array
+    px_area : float
+        the area of each image grid element
+    planet_radius : float
+        the radius of the planet relative to the radius of the star
+    offset_x : ndarray
+        shape (N,) numpy array containing x offset positions of the planet at
+        the desired times
+    offset_y : float
+        the constant offset position in the y direction
+    obliquity : float
+        the angle of the planet relative to its direction of motion in radians
+    ld_params : tuple
+        length 2 tuple of quadratic limb darkening parameters
+
+    Returns
+    -------
+    lc : ndarray
+        shape (N,) numpy array of the light curve data points
+    """
+    # initialise the light curve
+    lc = np.ones_like(offset_x, dtype=np.float64)
+
+    # populate the light curve
+    lc = fill_light_curve(
+        lc,
+        img,
+        xgrid,
+        ygrid,
+        px_area,
+        planet_radius,
+        offset_x,
+        offset_y,
+        obliquity,
+        ld_params
+    )
+
+    return lc
+
+
+@njit
+def fill_light_curve(
         lc,
         img,
         xgrid,
@@ -283,6 +344,7 @@ def occult_star(
         ld_params
 ):
     """
+    Populate a light curve
 
     Parameters
     ----------
@@ -383,9 +445,8 @@ if __name__ == "__main__":
     print("transit light curve generation...", end=' ')
     test_threshold = 1E-12
     lc_test_data = np.load('tests/transit_lc_gen_test_data.npz')
-    base_lc = np.ones_like(lc_test_data['lc_x_steps'], dtype=np.float64)
     lc = occult_star(
-        base_lc, lc_test_data['lc_img'],
+        lc_test_data['lc_img'],
         lc_test_data['lc_xgrid'], lc_test_data['lc_ygrid'],
         lc_test_data['lc_px_area'], lc_test_data['lc_p_rad'],
         lc_test_data['lc_x_steps'], lc_test_data['lc_y_offset'],

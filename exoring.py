@@ -380,16 +380,16 @@ def fill_light_curve(
     assert img.shape == xgrid.shape
     assert img.shape == ygrid.shape
 
-    # scale the opacity mask size
-    _xgrid = xgrid * planet_radius
-    _ygrid = ygrid * planet_radius
-    # scale the opacity mask element area
-    _px_area = px_area * planet_radius ** 2
-
     # rotate the opacity mask by the obliquity
     c_oblq, s_oblq = np.cos(obliquity), np.sin(obliquity)
-    _xgrid = _xgrid * c_oblq - _ygrid * s_oblq
-    _ygrid = _xgrid * s_oblq + _ygrid * c_oblq
+    _xgrid = xgrid * c_oblq - ygrid * s_oblq
+    _ygrid = xgrid * s_oblq + ygrid * c_oblq
+
+    # scale the opacity mask size
+    _xgrid = _xgrid * planet_radius
+    _ygrid = _ygrid * planet_radius
+    # scale the opacity mask element area
+    _px_area = px_area * planet_radius ** 2
 
     # apply the y direction positional offset
     _ygrid += offset_y
@@ -442,7 +442,7 @@ if __name__ == "__main__":
     else:
         print("failed")
 
-    print("transit light curve generation...", end=' ')
+    print("light curve generation...", end=' ')
     test_threshold = 1E-12
     lc_test_data = np.load('tests/transit_lc_gen_test_data.npz')
     lc = occult_star(

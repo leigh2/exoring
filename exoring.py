@@ -54,8 +54,8 @@ def build_exoring_image(
         outer_ring_radius,
         ring_opacity,
         gamma,
-        super_sample_factor=10,
-        full_output=False,
+        super_sample_factor = 10,
+        full_output = False,
 ):
     """
     Build an exoplanet + ring opacity mask.
@@ -135,12 +135,14 @@ def build_exoring_image(
     # calculate area of each grid element, units of r_planet^2
     elem_area = np.float64(pixel_scale) ** -2
 
-    # return the full image or nonzero values as requested
-    if full_output:
-        return er_image, xgrid, ygrid, elem_area
-    else:
+    # remove zero values if requested
+    if not full_output:
         ret = er_image > 0.0
-        return er_image[ret], xgrid[ret], ygrid[ret], elem_area
+        xgrid, ygrid, er_image = map(
+            lambda _a : _a[ret], [xgrid, ygrid, er_image]
+        )
+
+    return er_image, xgrid, ygrid, elem_area
 
 
 @njit

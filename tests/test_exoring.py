@@ -11,13 +11,17 @@ to test:
 - inner_rad > outer_rad
 """
 
+test_threshold = 1E-12
+
 
 def test_limb_darkening():
     qld_test_data = np.load("tests/quad_limb_dark_test_data.npz")
     test_intensities = quad_limb_dark(
         qld_test_data["radii"], *qld_test_data["ld_params"]
     )
-    assert all((qld_test_data["intensities"] - test_intensities).flatten() == 0)
+    assert all(np.abs(
+        qld_test_data["intensities"] - test_intensities
+    ).flatten() < test_threshold)
 
 
 def test_image_generation():
@@ -29,15 +33,17 @@ def test_image_generation():
         full_output=oig_test_data['full_output']
     )
     assert (
-            all((img - oig_test_data['op_img']).flatten() == 0) and
-            all((xgrid - oig_test_data['op_xgrid']).flatten() == 0) and
-            all((ygrid - oig_test_data['op_ygrid']).flatten() == 0) and
-            px_area == oig_test_data['op_area']
+            all(np.abs(
+                img - oig_test_data['op_img']).flatten() < test_threshold) and
+            all(np.abs(xgrid - oig_test_data[
+                'op_xgrid']).flatten() < test_threshold) and
+            all(np.abs(ygrid - oig_test_data[
+                'op_ygrid']).flatten() < test_threshold) and
+            np.abs(px_area - oig_test_data['op_area']) < test_threshold
     )
 
 
 def test_light_curve_generation():
-    test_threshold = 1E-12
     lc_test_data = np.load('tests/transit_lc_gen_test_data.npz')
     lc = occult_star(
         lc_test_data['lc_img'],

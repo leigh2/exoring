@@ -45,8 +45,8 @@ def build_exoring_image(
         outer_ring_radius,
         ring_opacity,
         gamma,
-        super_sample_factor = 10,
-        full_output = False,
+        super_sample_factor=10,
+        full_output=False,
 ):
     """
     Build an exoplanet + ring opacity mask.
@@ -130,7 +130,7 @@ def build_exoring_image(
     if not full_output:
         ret = er_image > 0.0
         xgrid, ygrid, er_image = map(
-            lambda _a : _a[ret], [xgrid, ygrid, er_image]
+            lambda _a: _a[ret], [xgrid, ygrid, er_image]
         )
 
     return er_image, xgrid, ygrid, elem_area
@@ -206,10 +206,9 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                 # the opacity is total.
                 value = 1.0
 
-            elif (px_inner_rad >= 1.0 and
-                  ((x_i / i_r) ** 2 + (y_i / i_r_min) ** 2 >= 1 and
-                   (x_o / o_r) ** 2 + (y_o / o_r_min) ** 2 <= 1
-                  )):
+            elif (px_inner_rad >= 1.0 and (
+                    (x_i / i_r) ** 2 + (y_i / i_r_min) ** 2 >= 1 and (
+                    x_o / o_r) ** 2 + (y_o / o_r_min) ** 2 <= 1)):
                 # The radius of the closest vertex of the pixel is outside the
                 # inner radius of the ring, and the radius of its furthest
                 # vertex is inside the outer radius of the ring. The inner
@@ -218,10 +217,9 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                 # planet and its opacity is that of the ring.
                 value = op
 
-            elif (px_inner_rad >= 1.0 and
-                  ((x_o / i_r) ** 2 + (y_o / i_r_min) ** 2 <= 1 or
-                   (x_i / o_r) ** 2 + (y_i / o_r_min) ** 2 >= 1
-                  )):
+            elif (px_inner_rad >= 1.0 and (
+                    (x_o / i_r) ** 2 + (y_o / i_r_min) ** 2 <= 1 or (
+                    x_i / o_r) ** 2 + (y_i / o_r_min) ** 2 >= 1)):
                 # The inner vertex of the pixel is outside the planet.
                 # Additionally, the outer vertex of the  pixels is closer than
                 # the inner edge of the ring, or the inner vertex is further

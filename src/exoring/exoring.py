@@ -24,15 +24,6 @@ def quad_limb_dark(radii, a, b):
         Stellar intensity at the requested radii.
     """
 
-    #todo
-    # get this running in numba, then will have to update tests as testing ld
-    # parameters used are invalid by this prescription
-    '''# warn if the limb darkening coefficients are invalid
-    # Kipping, D.M. 2013MNRAS.435.2152K eqn.8
-    valid_ld_params = (a + b) < 1 and a > 0 and (a + 2*b) > 0
-    if not valid_ld_params:
-        warnings.warn("limb darkening parameters may be invalid")'''
-
     # initialise intensity map
     intensity = np.zeros(radii.shape, dtype=np.float64)
 
@@ -54,8 +45,8 @@ def build_exoring_image(
         outer_ring_radius,
         ring_opacity,
         gamma,
-        super_sample_factor = 10,
-        full_output = False,
+        super_sample_factor=10,
+        full_output=False,
 ):
     """
     Build an exoplanet + ring opacity mask.
@@ -139,7 +130,7 @@ def build_exoring_image(
     if not full_output:
         ret = er_image > 0.0
         xgrid, ygrid, er_image = map(
-            lambda _a : _a[ret], [xgrid, ygrid, er_image]
+            lambda _a: _a[ret], [xgrid, ygrid, er_image]
         )
 
     return er_image, xgrid, ygrid, elem_area
@@ -215,10 +206,9 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                 # the opacity is total.
                 value = 1.0
 
-            elif (px_inner_rad >= 1.0 and
-                  ((x_i / i_r) ** 2 + (y_i / i_r_min) ** 2 >= 1 and
-                   (x_o / o_r) ** 2 + (y_o / o_r_min) ** 2 <= 1
-                  )):
+            elif (px_inner_rad >= 1.0 and (
+                    (x_i / i_r) ** 2 + (y_i / i_r_min) ** 2 >= 1 and (
+                    x_o / o_r) ** 2 + (y_o / o_r_min) ** 2 <= 1)):
                 # The radius of the closest vertex of the pixel is outside the
                 # inner radius of the ring, and the radius of its furthest
                 # vertex is inside the outer radius of the ring. The inner
@@ -227,10 +217,9 @@ def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                 # planet and its opacity is that of the ring.
                 value = op
 
-            elif (px_inner_rad >= 1.0 and
-                  ((x_o / i_r) ** 2 + (y_o / i_r_min) ** 2 <= 1 or
-                   (x_i / o_r) ** 2 + (y_i / o_r_min) ** 2 >= 1
-                  )):
+            elif (px_inner_rad >= 1.0 and (
+                    (x_o / i_r) ** 2 + (y_o / i_r_min) ** 2 <= 1 or (
+                    x_i / o_r) ** 2 + (y_i / o_r_min) ** 2 >= 1)):
                 # The inner vertex of the pixel is outside the planet.
                 # Additionally, the outer vertex of the  pixels is closer than
                 # the inner edge of the ring, or the inner vertex is further
@@ -409,51 +398,3 @@ def fill_light_curve(
             lc[i] = lc[i] - np.sum(img * px_flux)
 
     return lc
-
-
-if __name__ == "__main__":
-    print("running tests")
-
-    print("quadratic limb darkening...", end=' ')
-    qld_test_data = np.load("tests/quad_limb_dark_test_data.npz")
-    test_intensities = quad_limb_dark(
-        qld_test_data["radii"], *qld_test_data["ld_params"]
-    )
-    if all((qld_test_data["intensities"] - test_intensities).flatten() == 0):
-        print("passed")
-    else:
-        print("failed")
-
-    print("opacity image generation...", end=' ')
-    oig_test_data = np.load("tests/opacity_image_gen_test_data.npz")
-    img, xgrid, ygrid, px_area = build_exoring_image(
-        int(oig_test_data['ngrid']),
-        *oig_test_data['params'],
-        super_sample_factor=int(oig_test_data['super_sample_factor']),
-        full_output=oig_test_data['full_output']
-    )
-    if (
-            all((img - oig_test_data['op_img']).flatten() == 0) and
-            all((xgrid - oig_test_data['op_xgrid']).flatten() == 0) and
-            all((ygrid - oig_test_data['op_ygrid']).flatten() == 0) and
-            px_area == oig_test_data['op_area']
-    ):
-        print("passed")
-    else:
-        print("failed")
-
-    print("light curve generation...", end=' ')
-    test_threshold = 1E-12
-    lc_test_data = np.load('tests/transit_lc_gen_test_data.npz')
-    lc = occult_star(
-        lc_test_data['lc_img'],
-        lc_test_data['lc_xgrid'], lc_test_data['lc_ygrid'],
-        lc_test_data['lc_px_area'], lc_test_data['lc_p_rad'],
-        lc_test_data['lc_x_steps'], lc_test_data['lc_y_offset'],
-        lc_test_data['lc_obliq'], tuple(lc_test_data['lc_ld_params'])
-    )
-    diffs = np.abs(lc - lc_test_data['lc_result']).flatten()
-    if all(diffs < test_threshold):
-        print("passed")
-    else:
-        print("failed")

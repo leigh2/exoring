@@ -4,7 +4,7 @@ Exoring transit simulation using numerical integration.
 ![Tests](https://github.com/leigh2/exoring/actions/workflows/tests.yml/badge.svg)
 
 ## installation
-simply clone the repository, navigate to it, then run pip install.
+Simply clone the repository, navigate to it, then run pip install.
 ```sh
 git clone git@github.com:leigh2/exoring.git
 cd exoring

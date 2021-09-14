@@ -117,7 +117,7 @@ def build_exoring_image(
     )
 
     # fill the opacity image
-    er_image = fill_opacity_grid(
+    er_image = _fill_opacity_grid(
         xgrid, ygrid, er_image, gamma,
         inner_ring_radius, outer_ring_radius, ring_opacity,
         ssf=super_sample_factor
@@ -137,7 +137,7 @@ def build_exoring_image(
 
 
 @njit
-def fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
+def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
     """
     Fill an opacity grid image with a planet and ring.
 
@@ -270,7 +270,7 @@ def occult_star(
         ld_params
 ):
     """
-    Occult a star by the transparency image, producint a light curve.
+    Occult a star by the transparency image, producing a light curve.
 
     Parameters
     ----------
@@ -303,7 +303,7 @@ def occult_star(
     lc = np.ones_like(offset_x, dtype=np.float64)
 
     # populate the light curve
-    lc = fill_light_curve(
+    lc = _fill_light_curve(
         lc,
         img,
         xgrid,
@@ -320,7 +320,7 @@ def occult_star(
 
 
 @njit
-def fill_light_curve(
+def _fill_light_curve(
         lc,
         img,
         xgrid,

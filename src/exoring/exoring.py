@@ -4,8 +4,6 @@ import numpy as np
 from numba import njit
 import warnings
 
-__version__ = "0.1"
-
 
 @njit
 def quad_limb_dark(radii, a, b):

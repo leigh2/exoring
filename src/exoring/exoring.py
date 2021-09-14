@@ -381,8 +381,22 @@ def _fill_light_curve(
     # apply the y direction positional offset
     _ygrid += offset_y
 
+    # if the minimum y pixel position is outside the star break it will never
+    # transit, return the unchanged lightcurve
+    _miny = np.min(_ygrid)
+    if _miny > 1:
+        return lc
+
+    # max extent in x
+    _maxx = np.max(_xgrid)
+
     # now for each x offset position
     for i in range(offset_x.size):
+
+        # skip if the object has no hope of transiting
+        if offset_x[i] - _maxx > 1:
+            continue
+
         _xg = _xgrid + offset_x[i]
 
         # radius of each pixel

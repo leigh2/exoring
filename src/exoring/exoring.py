@@ -281,7 +281,7 @@ def _fill_opacity_grid_single(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
 @njit
 def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_rs, o_rs, ops, ssf=10):
     """
-    Fill an opacity grid image with a planet and ring.
+    Fill an opacity grid image with a planet and multiple rings.
 
     Parameters
     ----------

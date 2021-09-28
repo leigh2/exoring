@@ -5,6 +5,9 @@ import numpy as np
 from math import ceil, sin, cos, asin, pi, log2, exp
 from numba import cuda
 
+# make sure a cuda enabled device is available
+assert cuda.is_available()
+
 # GPU shared array shape must be set at compile time, this means it and it's
 # precursors must be defined here. Read the precursors from a config file, and
 # then define the shape of the shared array.
@@ -22,7 +25,7 @@ gpu_tpb_lcsum = gpu_config.as_int('gpu_tpb_lcsum')
 # verify the tuples are the correct length
 assert len(gpu_tpb_imgen) == 2
 assert len(gpu_tpb_lcgen) == 3
-#todo
+# todo
 # verify values are powers of 2
 
 # gpu shared array shape *must* be set at compile time
@@ -61,7 +64,7 @@ class ExoRing:
             in which to build the opacity images. Each dimension size should be
             a power of two. (Default: (512, 1024).)
         """
-        #todo
+        # todo
         # verify values are powers of 2
 
         # verify img_array_shape is the correct length

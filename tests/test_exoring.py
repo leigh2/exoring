@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import numpy as np
-from exoring import quad_limb_dark, build_exoring_image, occult_star
+from exoring import build_exoring_image, occult_star
 
 """
 Notes
@@ -12,16 +12,6 @@ to test:
 """
 
 test_threshold = 1E-12
-
-
-def test_limb_darkening():
-    qld_test_data = np.load("tests/quad_limb_dark_test_data.npz")
-    test_intensities = quad_limb_dark(
-        qld_test_data["radii"], *qld_test_data["ld_params"]
-    )
-    assert all(np.abs(
-        qld_test_data["intensities"] - test_intensities
-    ).flatten() < test_threshold)
 
 
 def test_image_generation():

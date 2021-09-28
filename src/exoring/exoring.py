@@ -2,45 +2,14 @@
 
 import numpy as np
 from numba import njit
-
-
-@njit
-def quad_limb_dark(radii, a, b):
-    """Intensity as a function of radius for the quadratic limb darkening model.
-
-    Parameters
-    ----------
-    radii : ndarray
-        Radii as a fraction of stellar radius.
-    a,b, : float, float
-        Quadratic limb darkening coefficients.
-
-    Returns
-    -------
-    intensity : ndarray
-        Stellar intensity at the requested radii.
-    """
-
-    # initialise intensity map
-    intensity = np.zeros(radii.shape, dtype=np.float64)
-
-    # numba requires 1d arrays, ravels are views
-    flat_r = radii.ravel()
-    flat_i = intensity.ravel()
-
-    # evaluate limb darkening model
-    le1 = np.abs(flat_r) <= 1.0
-    c_mu = 1.0 - np.cos(np.arcsin(flat_r[le1]))
-    flat_i[le1] = (1 - a * c_mu - b * c_mu ** 2) / (1 - a / 3 - b / 6) / np.pi
-
-    return intensity
+from math import ceil, sin, cos
 
 
 def build_exoring_image(
         pixel_scale,
         inner_ring_radii,
         outer_ring_radii,
-        ring_opacities,
+        ring_optical_depths,
         gamma,
         super_sample_factor=10,
         full_output=False
@@ -57,9 +26,8 @@ def build_exoring_image(
         The inner radius of the ring(s), in units of planet radii.
     outer_ring_radius : float or array-like
         The outer radius of the ring(s), in units of planet radii.
-    ring_opacity : float or array-like
-        The opacity of the ring(s), where 0 is fully transparent and 1 is fully
-        opaque.
+    ring_optical_depths : float or array-like
+        The normal optical depths of the ring(s).
     gamma : float
         Inclination angle relative to the line of sight to the observer in
         radians. An angle of 0.0 radians is hence invisible as ring depth is not
@@ -93,7 +61,7 @@ def build_exoring_image(
     # verify we have nice flat numpy arrays
     outer_ring_radii = np.asarray(outer_ring_radii).flatten()
     inner_ring_radii = np.asarray(inner_ring_radii).flatten()
-    ring_opacities = np.asarray(ring_opacities).flatten()
+    ring_optical_depths = np.asarray(ring_optical_depths).flatten()
 
     # check that the inner ring radii are always larger than the outer radii
     radii = np.column_stack((inner_ring_radii, outer_ring_radii)).copy()
@@ -106,16 +74,15 @@ def build_exoring_image(
 
     # verify that we have the same number of each ring paramter
     assert outer_ring_radii.size == inner_ring_radii.size
-    assert inner_ring_radii.size == ring_opacities.size
+    assert inner_ring_radii.size == ring_optical_depths.size
+
+    # convert normal optical depths to opacities
+    ring_opacities = 1 - np.exp(-ring_optical_depths/sin(gamma))
 
     # get the half size of the required grid in each dimension
     max_outer_rad_px = np.max(outer_ring_radii) * pixel_scale
-    ngrid_maj = max(
-        np.int_(np.ceil(max_outer_rad_px)), pixel_scale
-    )
-    ngrid_min = max(
-        np.int_(np.ceil(max_outer_rad_px * np.sin(gamma))), pixel_scale
-    )
+    ngrid_maj = max(ceil(max_outer_rad_px), pixel_scale)
+    ngrid_min = max(ceil(max_outer_rad_px * sin(gamma)), pixel_scale)
 
     # initialise the output arrays
     er_image = np.zeros((2 * ngrid_maj, 2 * ngrid_min), dtype=np.float64).T
@@ -143,7 +110,7 @@ def build_exoring_image(
         )
 
     # calculate area of each grid element, units of r_planet^2
-    elem_area = np.float64(pixel_scale) ** -2
+    elem_area = float(pixel_scale) ** -2
 
     # remove zero values if requested
     if not full_output:
@@ -189,18 +156,18 @@ def _fill_opacity_grid_single(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
     jhalf = jsize // 2
 
     # the pixel size in planetary radii (assuming square pixels)
-    pixsize = np.float_(xgrid[0, 1] - xgrid[0, 0])
+    pixsize = float(xgrid[0, 1] - xgrid[0, 0])
     half_pixsize = pixsize * 0.5
 
     # super-sample spacing
-    fssf = np.float64(ssf)
+    fssf = float(ssf)
     ss_gap = pixsize / fssf
     # super sample pixel contribution
     ss_cont = fssf ** -2
 
     # the minor axis sized of the inner and outer ring ellipses
-    i_r_min = np.sin(gamma) * i_r
-    o_r_min = np.sin(gamma) * o_r
+    i_r_min = sin(gamma) * i_r
+    o_r_min = sin(gamma) * o_r
 
     # for each pixel of a single quadrant
     for i in range(ihalf):
@@ -215,9 +182,9 @@ def _fill_opacity_grid_single(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
             y_i = ypos - half_pixsize  # y inner
             y_o = ypos + half_pixsize  # y outer
             # pixel outer radius
-            px_outer_rad = np.sqrt(x_o ** 2 + y_o ** 2)
+            px_outer_rad = (x_o ** 2 + y_o ** 2) ** 0.5
             # pixel inner radius
-            px_inner_rad = np.sqrt(x_i ** 2 + y_i ** 2)
+            px_inner_rad = (x_i ** 2 + y_i ** 2) ** 0.5
 
             if px_outer_rad <= 1.0:
                 # The radius of the furthest vertex of the pixel is inside the
@@ -258,7 +225,7 @@ def _fill_opacity_grid_single(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                         _xp = x_i + (0.5 + m) * ss_gap
                         _yp = y_i + (0.5 + n) * ss_gap
 
-                        if np.sqrt(_xp ** 2 + _yp ** 2) < 1.0:
+                        if (_xp ** 2 + _yp ** 2) ** 0.5 < 1.0:
                             # the super sample pixel centre is on the planet
                             value = value + ss_cont
 
@@ -269,16 +236,15 @@ def _fill_opacity_grid_single(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
                             value = value + op * ss_cont
 
             # send the value to the four relevant places in the image
-            image[ihalf + i, jhalf + j] = \
-                image[ihalf - i - 1, jhalf + j] = \
-                image[ihalf + i, jhalf - j - 1] = \
-                image[ihalf - i - 1, jhalf - j - 1] = \
-                value
+            image[ihalf + i, jhalf + j] = value
+            image[ihalf - i - 1, jhalf + j] = value
+            image[ihalf + i, jhalf - j - 1] = value
+            image[ihalf - i - 1, jhalf - j - 1] = value
 
     return image
 
 
-@njit
+@njit(parallel=True)
 def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_rs, o_rs, ops, ssf=10):
     """
     Fill an opacity grid image with a planet and multiple rings.
@@ -312,18 +278,18 @@ def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_rs, o_rs, ops, ssf=10):
     jhalf = jsize // 2
 
     # the pixel size in planetary radii (assuming square pixels)
-    pixsize = np.float_(xgrid[0, 1] - xgrid[0, 0])
+    pixsize = float(xgrid[0, 1] - xgrid[0, 0])
     half_pixsize = pixsize * 0.5
 
     # super-sample spacing
-    fssf = np.float64(ssf)
+    fssf = float(ssf)
     ss_gap = pixsize / fssf
     # super sample pixel contribution
     ss_cont = fssf ** -2
 
     # the minor axis sizes of the inner and outer ring ellipses
-    i_r_mins = np.sin(gamma) * i_rs
-    o_r_mins = np.sin(gamma) * o_rs
+    i_r_mins = sin(gamma) * i_rs
+    o_r_mins = sin(gamma) * o_rs
 
     # for each pixel of a single quadrant
     for i in range(ihalf):
@@ -338,9 +304,9 @@ def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_rs, o_rs, ops, ssf=10):
             y_i = ypos - half_pixsize  # y inner
             y_o = ypos + half_pixsize  # y outer
             # pixel outer radius
-            px_outer_rad = np.sqrt(x_o ** 2 + y_o ** 2)
+            px_outer_rad = (x_o ** 2 + y_o ** 2) ** 0.5
             # pixel inner radius
-            px_inner_rad = np.sqrt(x_i ** 2 + y_i ** 2)
+            px_inner_rad = (x_i ** 2 + y_i ** 2) ** 0.5
 
             # set finished flag
             fin = False
@@ -410,7 +376,7 @@ def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_rs, o_rs, ops, ssf=10):
                         _xp = x_i + (0.5 + m) * ss_gap
                         _yp = y_i + (0.5 + n) * ss_gap
 
-                        if np.sqrt(_xp ** 2 + _yp ** 2) < 1.0:
+                        if (_xp ** 2 + _yp ** 2) ** 0.5 < 1.0:
                             # the super sample pixel centre is on the planet
                             value = value + ss_cont
 
@@ -428,11 +394,10 @@ def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_rs, o_rs, ops, ssf=10):
                                     break
 
             # send the value to the four relevant places in the image
-            image[ihalf + i, jhalf + j] = \
-                image[ihalf - i - 1, jhalf + j] = \
-                image[ihalf + i, jhalf - j - 1] = \
-                image[ihalf - i - 1, jhalf - j - 1] = \
-                value
+            image[ihalf + i, jhalf + j] = value
+            image[ihalf - i - 1, jhalf + j] = value
+            image[ihalf + i, jhalf - j - 1] = value
+            image[ihalf - i - 1, jhalf - j - 1] = value
 
     return image
 
@@ -498,7 +463,7 @@ def occult_star(
     return lc
 
 
-@njit
+@njit(parallel=True)
 def _fill_light_curve(
         lc,
         img,
@@ -548,8 +513,11 @@ def _fill_light_curve(
     assert img.shape == xgrid.shape
     assert img.shape == ygrid.shape
 
+    # break out limd darkening parameters
+    ld_a, ld_b = ld_params
+
     # rotate the opacity mask by the obliquity
-    c_oblq, s_oblq = np.cos(obliquity), np.sin(obliquity)
+    c_oblq, s_oblq = cos(obliquity), sin(obliquity)
     _xgrid = xgrid * c_oblq - ygrid * s_oblq
     _ygrid = xgrid * s_oblq + ygrid * c_oblq
 
@@ -582,13 +550,21 @@ def _fill_light_curve(
         _xg = _xgrid + offset_x[i]
 
         # radius of each pixel
-        px_rad = np.sqrt(_xg ** 2 + _ygrid ** 2)
+        px_rad = (_xg ** 2 + _ygrid ** 2) ** 0.5
 
-        if np.min(px_rad) <= 1.0:
-            # compute the obscured flux of the star if an occultation occurs
-            px_flux = quad_limb_dark(px_rad, *ld_params) * _px_area
+        # numba requires 1d arrays for some operations, ravels are views
+        flat_rad = px_rad.ravel()
+        flat_img = img.ravel()
 
-            # subtract this flux from the light curve point
-            lc[i] = lc[i] - np.sum(img * px_flux)
+        # identify pixels that are on the star
+        le1 = np.abs(flat_rad) <= 1.0
+
+        # evaluate limb darkening model for these pixels
+        c_mu = 1.0 - np.cos(np.arcsin(flat_rad[le1]))
+        flat_i = ((1 - ld_a * c_mu - ld_b * c_mu ** 2)
+                  / (1 - ld_a / 3 - ld_b / 6) / np.pi) * _px_area
+
+        # subtract this flux from the light curve point
+        lc[i] = lc[i] - np.sum(flat_img[le1] * flat_i)
 
     return lc

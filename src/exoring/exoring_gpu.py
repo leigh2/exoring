@@ -135,7 +135,7 @@ class ExoRing:
                < self.img_array_shape[0]
 
         # convert normal optical depth to opacity
-        ring_opacity = 1 - exp(-ring_optical_depth / sin(gamma))
+        ring_opacity = 1 - exp(-ring_optical_depth / singamma)
 
         # the minor axis size of the inner and outer ring ellipses
         i_r_min = singamma * inner_ring_radius

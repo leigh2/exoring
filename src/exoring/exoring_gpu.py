@@ -188,7 +188,7 @@ class ExoRing:
             depth is not modelled.
         """
         # sin gamma
-        singamma = sin(gamma)
+        singamma = sin(gamma % 0.5*pi)
 
         # verify that the ring fits in the device image array
         assert self.planet_scale * outer_ring_radius <= self.img_array_shape[1]

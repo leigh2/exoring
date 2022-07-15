@@ -63,3 +63,6 @@ the full 2d image and grid to `occult_star` results in unnecessary computational
 expense.
 * The code is compiled jit by numba, meaning the first run of each of the above
 methods is relatively slow but subsequent executions are significantly faster.
+
+## Acknowledgements
+LCS acknowledges support from PLATO grant UKSA ST/R004838/1

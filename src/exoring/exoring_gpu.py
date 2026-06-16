@@ -180,6 +180,28 @@ class ExoRing:
             ])
             return img4q
 
+    def get_k(self):
+        """
+        Measure the effective radius scaling factor of the planet plus ring.
+
+        Returns
+        -------
+        k
+        """
+        # read the image from the device, only the primary quadrant is needed
+        img = self.read_image(return_full=False)
+
+        # sum of opacity elements in this single quadrant
+        total_opacity = img.sum()
+        # the sum of the opacity elements contributed by the planet in this
+        # quadrant
+        planet_opacity = 0.25 * pi * self.planet_scale**2
+
+        # calculate the radius scaling factor parameter
+        k = (total_opacity / planet_opacity)**0.5
+
+        return k
+
     def occult_star(
             self,
             x_array, y_array,

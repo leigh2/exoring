@@ -4,6 +4,13 @@ from configobj import ConfigObj
 import numpy as np
 from math import ceil, sin, cos, asin, pi, log2, exp
 from numba import cuda
+import warnings
+
+# ignore numba performance warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*will likely result in GPU under utilization due to low occupancy"
+)
 
 # make sure a cuda enabled device is available
 assert cuda.is_available()
@@ -20,7 +27,7 @@ gpu_tpb_imgen = tuple([int(f) for f in gpu_config['gpu_tpb_imgen']])
 # gpu threads per block for light curve generation
 gpu_tpb_lcgen = tuple([int(f) for f in gpu_config['gpu_tpb_lcgen']])
 # gpu threads per block for light curve reduction operation
-gpu_tpb_lcsum = gpu_config.as_int('gpu_tpb_lcsum')
+gpu_tpb_lcsum = gpu_config.as_int('gpu_tpb_lcsum')  # must be set at compile
 
 # verify the tuples are the correct length
 assert len(gpu_tpb_imgen) == 2
@@ -33,6 +40,8 @@ sarr_shape = (
     gpu_tpb_lcgen[0] * gpu_tpb_lcgen[1],
     gpu_tpb_lcgen[2]
 )
+# log2 of tpb for light curve reduction operations
+log2tpb_lcsum = int(log2(gpu_tpb_lcsum))
 
 
 class ExoRing:
@@ -106,6 +115,58 @@ class ExoRing:
         self.gpu_tpb_lcgen = gpu_tpb_lcgen
         # gpu threads per block for light curve reduction operation
         self.gpu_tpb_lcsum = gpu_tpb_lcsum
+
+        # initialise some instance variables
+        self.x_array = None
+        self.y_array = None
+        self.flux = None
+        self.flux_error = None
+        self.lc = None
+        self.bpg_lc_reduction = None
+        self._tmp = None
+
+    def put_xy_array(self, xarray, yarray):
+        """
+        Send the on-sky planet position relative to the star position to the
+        device.
+
+        Parameters
+        ----------
+        x_array : ndarray
+            1D Numpy array of (N,) 'X' positions of the centre of the planet
+            relative to the centre of the star in units of stellar radii.
+        y_array : ndarray
+            1D Numpy array of (N,) 'Y' positions of the centre of the planet
+            relative to the centre of the star in units of stellar radii.
+        """
+        # input verification
+        assert xarray.shape == yarray.shape
+        assert len(xarray.shape) == 1
+        # send arrays to device
+        self.x_array = cuda.to_device(xarray)
+        self.y_array = cuda.to_device(yarray)
+
+    def put_observed_lc(self, flux, flux_error):
+        """
+        Send an observed light curve to the device for use with on-device
+        model likelihood determination.
+
+        Parameters
+        ----------
+        flux : ndarray
+            1D Numpy array of (N,) flux points (normalised to baseline).
+        flux_error : ndarray
+            1D Numpy array of (N,) flux error points.
+        """
+        # input verification
+        assert flux.shape == flux_error.shape
+        assert len(flux.shape) == 1
+        # send arrays to device
+        self.flux = cuda.to_device(flux)
+        self.flux_error = cuda.to_device(flux_error)
+        # a temporary global array to be used for lightcurve reductions
+        self.bpg_lc_reduction = ceil(flux.size / gpu_tpb_lcsum)
+        self._tmp = cuda.device_array(self.bpg_lc_reduction, dtype=np.float64)
 
     def build_image(self,
                     inner_ring_radius, outer_ring_radius,
@@ -202,22 +263,14 @@ class ExoRing:
 
         return k
 
-    def occult_star(
-            self,
-            x_array, y_array,
-            planet_radius, obliquity, ld_params
-    ):
+    def occult_star(self, planet_radius, obliquity, ld_params):
         """
-        Produce a transit of the pre-generated opacity profile array across a star.
+        Produce a transit of the pre-generated opacity profile array across a
+        star. The x and y positions of the planet relative to the star must
+        already have been sent to the device.
 
         Parameters
         ----------
-        x_array : ndarray
-            1D Numpy array of (N,) 'X' positions of the centre of the planet
-            relative to the centre of the star in units of stellar radii.
-        y_array : ndarray
-            1D Numpy array of (N,) 'Y' positions of the centre of the planet
-            relative to the centre of the star in units of stellar radii.
         planet_radius : float
             The radius of the planet in units of stellar radii.
         obliquity : float
@@ -231,37 +284,167 @@ class ExoRing:
         1D numpy array of (N,) fractional flux values relative to baseline for
         the requested 'X' and 'Y' positions.
         """
-        # copy the x and y arrays to the device
-        _xa = cuda.to_device(x_array)
-        _ya = cuda.to_device(y_array)
+        if self.x_array is None or self.y_array is None:
+            raise RuntimeError("Can't produce light curve as x_array and/or "
+                               "y_array is empty")
+
         # open an output lightcurve array on the device
-        lc = cuda.device_array(x_array.size, dtype=np.float32)
+        self.lc = cuda.device_array(self.x_array.size, dtype=np.float32)
 
         # blocks per grid for the lc generation
         gpu_bpg_lcgen = (
             ceil(self.img_array_shape[0] / self.gpu_tpb_lcgen[0]),
             ceil(self.img_array_shape[1] / self.gpu_tpb_lcgen[1]),
-            ceil(x_array.size / self.gpu_tpb_lcgen[2])
+            ceil(self.x_array.size / self.gpu_tpb_lcgen[2])
         )
 
         # open a temporary array on the device to put the per-block results in
         _block_results = cuda.device_array(
-            (x_array.size, gpu_bpg_lcgen[0] * gpu_bpg_lcgen[1]),
+            (self.x_array.size, gpu_bpg_lcgen[0] * gpu_bpg_lcgen[1]),
             dtype=np.float32
         )
 
         # pixel contribution calculation
         _get_pixel_contrib[gpu_bpg_lcgen, self.gpu_tpb_lcgen](
-            _xa, _ya, self.img_array, _block_results, self.pixel_size,
-            planet_radius, obliquity, ld_params
+            self.x_array, self.y_array, self.img_array, _block_results,
+            self.pixel_size, planet_radius, obliquity, ld_params
         )
 
         # reduce the block results to produce the lightcurve using:
         # delta_flux = 1 - sum(_block_results, axis=1)
-        gpu_bpg_lcsum = ceil(x_array.size / self.gpu_tpb_lcsum)
-        _sum_lc_contrib[gpu_bpg_lcsum, self.gpu_tpb_lcsum](_block_results, lc)
+        gpu_bpg_lcsum = ceil(self.x_array.size / self.gpu_tpb_lcsum)
+        _sum_lc_contrib[gpu_bpg_lcsum, self.gpu_tpb_lcsum](
+            _block_results, self.lc
+        )
 
-        return lc.copy_to_host()
+    def read_lightcurve(self):
+        """
+        Read the light curve array from the device.
+
+        Returns
+        -------
+        The model light curve.
+        """
+        if self.lc is None:
+            raise RuntimeError(
+                "model lightcurve array is empty, can't copy from device"
+            )
+        else:
+            return self.lc.copy_to_host()
+
+    def get_loglikelihood(self):
+        """
+        Compute the log-likelihood of the lightcurve data given a set of model
+        parameters.
+
+        Returns
+        -------
+        The log-likelihood of the model given the data.
+        """
+        if self.lc is None:
+            raise RuntimeError(
+                "model lightcurve array is empty, can't compute log likelihood"
+            )
+        elif self.flux is None:
+            raise RuntimeError(
+                "fluxes not provided, can't compute log likelihood"
+            )
+        elif self.flux_error is None:
+            raise RuntimeError(
+                "flux errors not provided, can't compute log likelihood"
+            )
+        elif self._tmp is None:
+            raise RuntimeError(
+                "_tmp array does not exist, can't compute log likelihood"
+            )
+        else:
+            # open a single element chisq array on the device
+            _chisq = cuda.to_device(np.zeros(1, dtype=np.float64))
+
+            # compute the chisq into the temporary array
+            _get_chisq[self.bpg_lc_reduction, self.gpu_tpb_lcsum](
+                self.lc, self.flux, self.flux_error, self._tmp
+            )
+
+            # final sum reduction using atomic operations to get a single chisq
+            # value
+            _bpg = ceil(self._tmp.size / self.gpu_tpb_lcsum)
+            _atomic_sum[_bpg, self.gpu_tpb_lcsum](self._tmp, _chisq)
+
+            # copy the single-element chisq array from the device and extract it
+            chisq = _chisq.copy_to_host()[0]
+
+            # return the log likelihood
+            return -0.5 * chisq
+
+
+@cuda.jit
+def _get_chisq(model, flux, error, out_array):
+    # open a working array in shared memory
+    sarr = cuda.shared.array(shape=(gpu_tpb_lcsum,), dtype=np.float64)
+
+    # shared array thread index
+    sarr_idx = cuda.threadIdx.x
+
+    # global thread index
+    i = cuda.grid(1)
+
+    if i >= model.size:
+        # add nothing if thread is out of bounds
+        sarr[sarr_idx] = 0.0
+    else:
+        # read the contribution of this element into shared memory
+        sarr[sarr_idx] = ((flux[i] - model[i]) / error[i]) ** 2
+
+    # sync all threads in this block
+    cuda.syncthreads()
+
+    # now perform an array sum reduction
+    for ll in range(log2tpb_lcsum - 1, -1, -1):
+        lim = 1 << ll
+        if sarr_idx < lim:
+            sarr[sarr_idx] += sarr[sarr_idx + lim]
+        cuda.syncthreads()
+
+    # send this contribution to the temporary array
+    if sarr_idx == 0:
+        out_array[cuda.blockIdx.x] = sarr[0]
+
+
+@cuda.jit
+def _atomic_sum(inarray, outarray):
+    # open a working array in shared memory
+    sarr = cuda.shared.array(shape=(gpu_tpb_lcsum,), dtype=np.float64)
+    # shared array thread index
+    sarr_idx = cuda.threadIdx.x
+    # global thread index
+    i = cuda.grid(1)
+
+    if i >= inarray.size:
+        # add nothing if thread is out of bounds
+        sarr[sarr_idx] = 0.0
+    else:
+        # read the contribution of this element into shared memory
+        sarr[sarr_idx] = inarray[i]
+
+    # sync all threads in this block
+    cuda.syncthreads()
+
+    # now perform an array sum reduction
+    for ll in range(log2tpb_lcsum - 1, -1, -1):
+        lim = 1 << ll
+        if sarr_idx < lim:
+            sarr[sarr_idx] += sarr[sarr_idx + lim]
+        cuda.syncthreads()
+
+    # atomic adds are done serially to avoid race conditions, but provided not
+    # too many need to be done this is ok. In our case it need only be done once
+    # per block. Even a 2 year at 25s integration light curve need only do ~2500
+    # atomic adds with 1024 threads per block.
+
+    # atomic add this contribution to the chisq value
+    if sarr_idx == 0:
+        cuda.atomic.add(outarray, 0, sarr[0])
 
 
 @cuda.jit

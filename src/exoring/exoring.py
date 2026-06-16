@@ -1,570 +1,706 @@
 #!/usr/bin/env python3
 
+from configobj import ConfigObj
 import numpy as np
-from numba import njit
-from math import ceil, sin, cos
+from math import ceil, sin, cos, asin, pi, log2, exp
+from numba import cuda
+import warnings
+
+# ignore numba performance warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*will likely result in GPU under utilization due to low occupancy"
+)
+
+# make sure a cuda enabled device is available
+assert cuda.is_available()
+
+# GPU shared array shape must be set at compile time, this means it and it's
+# precursors must be defined here. Read the precursors from a config file, and
+# then define the shape of the shared array.
+
+# open the config file
+gpu_config = ConfigObj('gpu_config.cfg')
+
+# gpu threads per block for image generation
+gpu_tpb_imgen = tuple([int(f) for f in gpu_config['gpu_tpb_imgen']])
+# gpu threads per block for light curve generation
+gpu_tpb_lcgen = tuple([int(f) for f in gpu_config['gpu_tpb_lcgen']])
+# gpu threads per block for light curve reduction operation
+gpu_tpb_lcsum = gpu_config.as_int('gpu_tpb_lcsum')  # must be set at compile
+
+# verify the tuples are the correct length
+assert len(gpu_tpb_imgen) == 2
+assert len(gpu_tpb_lcgen) == 3
+# todo
+# verify values are powers of 2
+
+# gpu shared array shape *must* be set at compile time
+sarr_shape = (
+    gpu_tpb_lcgen[0] * gpu_tpb_lcgen[1],
+    gpu_tpb_lcgen[2]
+)
+# log2 of tpb for light curve reduction operations
+log2tpb_lcsum = int(log2(gpu_tpb_lcsum))
 
 
-def build_exoring_image(
-        pixel_scale,
-        inner_ring_radii,
-        outer_ring_radii,
-        ring_optical_depths,
-        gamma,
-        super_sample_factor=10,
-        full_output=False
-):
+class ExoRing:
     """
-    Build an exoplanet + ring opacity mask.
-
-    Parameters
-    ----------
-    pixel_scale : int
-        The scale of the required opacity image, parametrized as the number of
-        pixels per planet radius.
-    inner_ring_radius : float or array-like
-        The inner radius of the ring(s), in units of planet radii.
-    outer_ring_radius : float or array-like
-        The outer radius of the ring(s), in units of planet radii.
-    ring_optical_depths : float or array-like
-        The normal optical depths of the ring(s).
-    gamma : float
-        Inclination angle relative to the line of sight to the observer in
-        radians. An angle of 0.0 radians is hence invisible as ring depth is not
-        modelled.
-    super_sample_factor : int, optional
-        Pixels which straddle the planet and/or ring boundary are super-sampled
-        to estimate the appropriate opacity. super_sample_factor is the number
-        of subdivisions along each dimension. (Default: 10.)
-    full_output : bool, optional
-        If True return the complete 2-dimensional opacity array (image). If
-        False return only the array elements which have nonzero opacity.
-        (Default: False.)
-
-    Returns
-    -------
-    exoring_image : ndarray
-        The opacity image. If full_output is True this is an array with ndim=2,
-        otherwise it is flattened and includes only elements with nonzero
-        opacity.
-    x, y : ndarrays
-        The x and y positions of each image element in units of planet radii
-        and centred at the planet centre. These are either ndim=2 or flattened
-        arrays depending on the state of full_output.
-        Note that the occulter can be rescaled, rotated, translated, etc. by
-        simply applying the appropriate transformations to these arrays.
-    area : float
-        The area of each transparency profile element in units of planetary
-        radii squared.
+    Exoring light curve generation class.
     """
 
-    # verify we have nice flat numpy arrays
-    outer_ring_radii = np.asarray(outer_ring_radii).flatten()
-    inner_ring_radii = np.asarray(inner_ring_radii).flatten()
-    ring_optical_depths = np.asarray(ring_optical_depths).flatten()
+    def __init__(
+            self,
+            planet_scale=200,
+            super_sample_factor=10,
+            img_array_shape=(512, 1024)
+    ):
+        """
+        Initialise the exoring light curve generation class instance
 
-    # check that the inner ring radii are always larger than the outer radii
-    radii = np.column_stack((inner_ring_radii, outer_ring_radii)).copy()
-    inner_ring_radii = np.min(radii, axis=1)
-    outer_ring_radii = np.max(radii, axis=1)
+        Parameters
+        ----------
+        planet_scale : int, optional
+            The number of image array elements per planet radius, this must fit
+            within the first element of `img_array_shape`. (Default: 200.)
+        super_sample_factor : int, optional
+            Pixels which straddle the planet and/or ring boundary are
+            super-sampled to estimate the appropriate opacity.
+            `super_sample_factor` is the number of subdivisions along each
+            dimension. (Default: 10.)
+        img_array_shape : tuple, optional
+            Tuple of length 2, dictating the shape of the on-device image array
+            in which to build the opacity images. Each dimension size should be
+            a power of two. (Default: (512, 1024).)
+        """
+        # todo
+        # verify values are powers of 2
 
-    # verify that the rings don't overlap if there are multiple
-    if np.any((inner_ring_radii[1:] - outer_ring_radii[:-1]) < 0):
-        raise RuntimeError("Rings cannot overlap")
+        # verify img_array_shape is the correct length
+        assert len(img_array_shape) == 2
+        # verify that the planet fits in the device image array
+        assert planet_scale <= img_array_shape[0]
 
-    # verify that we have the same number of each ring paramter
-    assert outer_ring_radii.size == inner_ring_radii.size
-    assert inner_ring_radii.size == ring_optical_depths.size
+        # pixel scale, i.e. number of image array elements per planet radius
+        self.planet_scale = planet_scale
+        # pixel size, i.e. planetary radii per pixel
+        self.pixel_size = 1.0 / planet_scale
 
-    # convert normal optical depths to opacities
-    ring_opacities = 1 - np.exp(-ring_optical_depths/sin(gamma))
+        # super_sample_factor is the number of subdivisions along each dimension
+        # in which to split each image array element when evaluating the mean
+        # opacity of an element which spans a ring or planet edge
+        self.super_sample_factor = super_sample_factor
+        # super-sample spacing
+        fssf = float(self.super_sample_factor)
+        self.ss_gap = self.pixel_size / fssf
+        # super sample pixel contribution
+        self.ss_cont = fssf ** -2
 
-    # get the half size of the required grid in each dimension
-    max_outer_rad_px = np.max(outer_ring_radii) * pixel_scale
-    ngrid_maj = max(ceil(max_outer_rad_px), pixel_scale)
-    ngrid_min = max(ceil(max_outer_rad_px * sin(gamma)), pixel_scale)
-
-    # initialise the output arrays
-    er_image = np.zeros((2 * ngrid_maj, 2 * ngrid_min), dtype=np.float64).T
-    # meshgrid was marginally faster than mgrid in the scenarios tested
-    xgrid, ygrid = np.meshgrid(
-        (np.arange(-ngrid_maj, ngrid_maj) + 0.5) / pixel_scale,
-        (np.arange(-ngrid_min, ngrid_min) + 0.5) / pixel_scale
-    )
-
-    # fill the opacity image
-    # there are performance gains made by running single rings through a
-    # simplified image generation function (roughly a factor of 2 during my
-    # limited testing), hence the different functions
-    if inner_ring_radii.size == 1:
-        er_image = _fill_opacity_grid_single(
-            xgrid, ygrid, er_image, gamma,
-            inner_ring_radii[0], outer_ring_radii[0], ring_opacities[0],
-            ssf=super_sample_factor
+        # gpu threads per block for image generation
+        self.gpu_tpb_imgen = gpu_tpb_imgen
+        # opacity image array
+        self.img_array_shape = img_array_shape
+        # gpu blocks per grid for image generation
+        self.gpu_bpg_imgen = (
+            ceil(img_array_shape[0] / gpu_tpb_imgen[0]),
+            ceil(img_array_shape[1] / gpu_tpb_imgen[1])
         )
+
+        # open the image array on the device
+        # 32 bit floats should be sufficient for a final precision a little
+        # better than 0.1 ppm
+        self.img_array = cuda.device_array(img_array_shape, dtype=np.float32)
+
+        # gpu threads per block for light curve generation
+        self.gpu_tpb_lcgen = gpu_tpb_lcgen
+        # gpu threads per block for light curve reduction operation
+        self.gpu_tpb_lcsum = gpu_tpb_lcsum
+
+        # initialise some instance variables
+        self.x_array = None
+        self.y_array = None
+        self.flux = None
+        self.flux_error = None
+        self.lc = None
+        self.bpg_lc_reduction = None
+        self._tmp = None
+
+    def put_xy_array(self, xarray, yarray):
+        """
+        Send the on-sky planet position relative to the star position to the
+        device.
+
+        Parameters
+        ----------
+        x_array : ndarray
+            1D Numpy array of (N,) 'X' positions of the centre of the planet
+            relative to the centre of the star in units of stellar radii.
+        y_array : ndarray
+            1D Numpy array of (N,) 'Y' positions of the centre of the planet
+            relative to the centre of the star in units of stellar radii.
+        """
+        # input verification
+        assert xarray.shape == yarray.shape
+        assert len(xarray.shape) == 1
+        # send arrays to device
+        self.x_array = cuda.to_device(xarray)
+        self.y_array = cuda.to_device(yarray)
+
+    def put_observed_lc(self, flux, flux_error):
+        """
+        Send an observed light curve to the device for use with on-device
+        model likelihood determination.
+
+        Parameters
+        ----------
+        flux : ndarray
+            1D Numpy array of (N,) flux points (normalised to baseline).
+        flux_error : ndarray
+            1D Numpy array of (N,) flux error points.
+        """
+        # input verification
+        assert flux.shape == flux_error.shape
+        assert len(flux.shape) == 1
+        # send arrays to device
+        self.flux = cuda.to_device(flux)
+        self.flux_error = cuda.to_device(flux_error)
+        # a temporary global array to be used for lightcurve reductions
+        self.bpg_lc_reduction = ceil(flux.size / gpu_tpb_lcsum)
+        self._tmp = cuda.device_array(self.bpg_lc_reduction, dtype=np.float64)
+
+    def build_image(self,
+                    inner_ring_radius, outer_ring_radius,
+                    ring_optical_depth, gamma):
+        """
+        Build an exoplanet-plus-ring opacity mask on the gpu.
+
+        Parameters
+        ----------
+        inner_ring_radius : float or array-like
+            The inner radius of the ring in units of planet radii.
+        outer_ring_radius : float or array-like
+            The outer radius of the ring in units of planet radii.
+        ring_optical_depth : float or array-like
+            The normal optical depth of the ring.
+        gamma : float
+            Inclination angle relative to the line of sight to the observer in
+            radians. At an angle of 0.0 radians the ring is invisible as ring
+            depth is not modelled.
+        """
+        # sin gamma
+        singamma = sin(gamma % (0.5*pi))
+
+        # verify that the ring fits in the device image array
+        assert self.planet_scale * outer_ring_radius <= self.img_array_shape[1]
+        assert self.planet_scale * outer_ring_radius * singamma \
+               < self.img_array_shape[0]
+
+        # convert normal optical depth to opacity
+        if singamma != 0:
+            ring_opacity = 1.0 - exp(-ring_optical_depth / singamma)
+        else:
+            ring_opacity = 1.0
+
+        # the minor axis size of the inner and outer ring ellipses
+        i_r_min = singamma * inner_ring_radius
+        o_r_min = singamma * outer_ring_radius
+
+        # fill the image array on the gpu
+        _fill_image_gpu[self.gpu_bpg_imgen, self.gpu_tpb_imgen](
+            self.img_array, self.pixel_size, i_r_min, inner_ring_radius,
+            o_r_min, outer_ring_radius, ring_opacity, self.super_sample_factor,
+            self.ss_gap, self.ss_cont
+        )
+
+    def read_image(self, return_full=True):
+        """
+        Copy the exoring opacity image from the gpu to the host and return it,
+        mirrored or otherwise.
+
+        Parameters
+        ----------
+        return_full : bool, optional
+            If True, mirror the single quadrant across each axis to produce the
+            full image (default behaviour). If False only return the single
+            quadrant.
+
+        Returns
+        -------
+        The opacity array of the exoplanet, either a single quadrant (in which
+        case the array is the same shape as `img_array_shape`) or mirrored in
+        both dimensions (in which case it is twice `img_array_shape` in each
+        dimension).
+        """
+        # grab the single quadrant array from the gpu
+        img1q = self.img_array.copy_to_host()
+        if not return_full:
+            # return the single quadrant
+            return img1q
+        else:
+            # mirror about both axis
+            img4q = np.block([
+                [np.flip(img1q), np.flip(img1q, axis=0)],
+                [np.flip(img1q, axis=1), img1q]
+            ])
+            return img4q
+
+    def get_k(self):
+        """
+        Measure the effective radius scaling factor of the planet plus ring.
+
+        Returns
+        -------
+        k
+        """
+        # read the image from the device, only the primary quadrant is needed
+        img = self.read_image(return_full=False)
+
+        # sum of opacity elements in this single quadrant
+        total_opacity = img.sum()
+        # the sum of the opacity elements contributed by the planet in this
+        # quadrant
+        planet_opacity = 0.25 * pi * self.planet_scale**2
+
+        # calculate the radius scaling factor parameter
+        k = (total_opacity / planet_opacity)**0.5
+
+        return k
+
+    def occult_star(self, planet_radius, obliquity, ld_params):
+        """
+        Produce a transit of the pre-generated opacity profile array across a
+        star. The x and y positions of the planet relative to the star must
+        already have been sent to the device.
+
+        Parameters
+        ----------
+        planet_radius : float
+            The radius of the planet in units of stellar radii.
+        obliquity : float
+            The inclination in radians of the planet in the plane of its orbit.
+            Runs clockwise, positive from zero parallel to the 'X' axis.
+        ld_params : tuple
+            Tuple of two quadratic limb darkening parameters for the star
+
+        Returns
+        -------
+        1D numpy array of (N,) fractional flux values relative to baseline for
+        the requested 'X' and 'Y' positions.
+        """
+        if self.x_array is None or self.y_array is None:
+            raise RuntimeError("Can't produce light curve as x_array and/or "
+                               "y_array is empty")
+
+        # open an output lightcurve array on the device
+        self.lc = cuda.device_array(self.x_array.size, dtype=np.float32)
+
+        # blocks per grid for the lc generation
+        gpu_bpg_lcgen = (
+            ceil(self.img_array_shape[0] / self.gpu_tpb_lcgen[0]),
+            ceil(self.img_array_shape[1] / self.gpu_tpb_lcgen[1]),
+            ceil(self.x_array.size / self.gpu_tpb_lcgen[2])
+        )
+
+        # open a temporary array on the device to put the per-block results in
+        _block_results = cuda.device_array(
+            (self.x_array.size, gpu_bpg_lcgen[0] * gpu_bpg_lcgen[1]),
+            dtype=np.float32
+        )
+
+        # pixel contribution calculation
+        _get_pixel_contrib[gpu_bpg_lcgen, self.gpu_tpb_lcgen](
+            self.x_array, self.y_array, self.img_array, _block_results,
+            self.pixel_size, planet_radius, obliquity, ld_params
+        )
+
+        # reduce the block results to produce the lightcurve using:
+        # delta_flux = 1 - sum(_block_results, axis=1)
+        gpu_bpg_lcsum = ceil(self.x_array.size / self.gpu_tpb_lcsum)
+        _sum_lc_contrib[gpu_bpg_lcsum, self.gpu_tpb_lcsum](
+            _block_results, self.lc
+        )
+
+    def read_lightcurve(self):
+        """
+        Read the light curve array from the device.
+
+        Returns
+        -------
+        The model light curve.
+        """
+        if self.lc is None:
+            raise RuntimeError(
+                "model lightcurve array is empty, can't copy from device"
+            )
+        else:
+            return self.lc.copy_to_host()
+
+    def get_loglikelihood(self):
+        """
+        Compute the log-likelihood of the lightcurve data given a set of model
+        parameters.
+
+        Returns
+        -------
+        The log-likelihood of the model given the data.
+        """
+        if self.lc is None:
+            raise RuntimeError(
+                "model lightcurve array is empty, can't compute log likelihood"
+            )
+        elif self.flux is None:
+            raise RuntimeError(
+                "fluxes not provided, can't compute log likelihood"
+            )
+        elif self.flux_error is None:
+            raise RuntimeError(
+                "flux errors not provided, can't compute log likelihood"
+            )
+        elif self._tmp is None:
+            raise RuntimeError(
+                "_tmp array does not exist, can't compute log likelihood"
+            )
+        else:
+            # open a single element chisq array on the device
+            _chisq = cuda.to_device(np.zeros(1, dtype=np.float64))
+
+            # compute the chisq into the temporary array
+            _get_chisq[self.bpg_lc_reduction, self.gpu_tpb_lcsum](
+                self.lc, self.flux, self.flux_error, self._tmp
+            )
+
+            # final sum reduction using atomic operations to get a single chisq
+            # value
+            _bpg = ceil(self._tmp.size / self.gpu_tpb_lcsum)
+            _atomic_sum[_bpg, self.gpu_tpb_lcsum](self._tmp, _chisq)
+
+            # copy the single-element chisq array from the device and extract it
+            chisq = _chisq.copy_to_host()[0]
+
+            # return the log likelihood
+            return -0.5 * chisq
+
+
+@cuda.jit
+def _get_chisq(model, flux, error, out_array):
+    # open a working array in shared memory
+    sarr = cuda.shared.array(shape=(gpu_tpb_lcsum,), dtype=np.float64)
+
+    # shared array thread index
+    sarr_idx = cuda.threadIdx.x
+
+    # global thread index
+    i = cuda.grid(1)
+
+    if i >= model.size:
+        # add nothing if thread is out of bounds
+        sarr[sarr_idx] = 0.0
     else:
-        er_image = _fill_opacity_grid(
-            xgrid, ygrid, er_image, gamma,
-            inner_ring_radii, outer_ring_radii, ring_opacities,
-            ssf=super_sample_factor
-        )
+        # read the contribution of this element into shared memory
+        sarr[sarr_idx] = ((flux[i] - model[i]) / error[i]) ** 2
 
-    # calculate area of each grid element, units of r_planet^2
-    elem_area = float(pixel_scale) ** -2
+    # sync all threads in this block
+    cuda.syncthreads()
 
-    # remove zero values if requested
-    if not full_output:
-        ret = er_image > 0.0
-        xgrid, ygrid, er_image = map(
-            lambda _a: _a[ret], [xgrid, ygrid, er_image]
-        )
+    # now perform an array sum reduction
+    for ll in range(log2tpb_lcsum - 1, -1, -1):
+        lim = 1 << ll
+        if sarr_idx < lim:
+            sarr[sarr_idx] += sarr[sarr_idx + lim]
+        cuda.syncthreads()
 
-    return er_image, xgrid, ygrid, elem_area
+    # send this contribution to the temporary array
+    if sarr_idx == 0:
+        out_array[cuda.blockIdx.x] = sarr[0]
 
 
-@njit
-def _fill_opacity_grid_single(xgrid, ygrid, image, gamma, i_r, o_r, op, ssf=10):
+@cuda.jit
+def _atomic_sum(inarray, outarray):
+    # open a working array in shared memory
+    sarr = cuda.shared.array(shape=(gpu_tpb_lcsum,), dtype=np.float64)
+    # shared array thread index
+    sarr_idx = cuda.threadIdx.x
+    # global thread index
+    i = cuda.grid(1)
+
+    if i >= inarray.size:
+        # add nothing if thread is out of bounds
+        sarr[sarr_idx] = 0.0
+    else:
+        # read the contribution of this element into shared memory
+        sarr[sarr_idx] = inarray[i]
+
+    # sync all threads in this block
+    cuda.syncthreads()
+
+    # now perform an array sum reduction
+    for ll in range(log2tpb_lcsum - 1, -1, -1):
+        lim = 1 << ll
+        if sarr_idx < lim:
+            sarr[sarr_idx] += sarr[sarr_idx + lim]
+        cuda.syncthreads()
+
+    # atomic adds are done serially to avoid race conditions, but provided not
+    # too many need to be done this is ok. In our case it need only be done once
+    # per block. Even a 2 year at 25s integration light curve need only do ~2500
+    # atomic adds with 1024 threads per block.
+
+    # atomic add this contribution to the chisq value
+    if sarr_idx == 0:
+        cuda.atomic.add(outarray, 0, sarr[0])
+
+
+@cuda.jit
+def _get_pixel_contrib(xa, ya, img, bres, pxsize, prad, oblqty, ldpars):
     """
-    Fill an opacity grid image with a planet and a single ring.
+    Evaluate the fraction of flux blocked for each opacity grid element for each
+    planet position point. Run a first pass sum reduction to reduce the
+    resultant large 3D grid to a smaller 2D grid.
 
     Parameters
     ----------
-    xgrid : ndarray
-        x grid coordinates
-    ygrid : ndarray
-        y grid coordinates
+    xa : ndarray
+        1D array of (N,) 'X' positions of the centre of the planet relative to
+        the centre of the star in units of stellar radii.
+    ya : ndarray
+        1D array of (N,) 'Y' positions of the centre of the planet relative to
+        the centre of the star in units of stellar radii.
+    img : ndarray
+        2D opacity grid array.
+    bres : ndarray
+        Temporary 2D array in which to place the result of the first pass sum
+        reduction.
+    pxsize : float
+        The size of each opacity array element in units of planetary radii
+        squared.
+    prad : float
+        The radius of the planet in units of stellar radii.
+    oblqty : float
+        The inclination in radians of the planet in the plane of its orbit. Runs
+        clockwise, positive from zero parallel to the 'X' axis.
+    ldpars : tuple
+        Tuple of two quadratic limb darkening parameters for the star
+    """
+    # break out the limb darkening parameters
+    ld_a, ld_b = ldpars
+
+    # open a working array in shared memory
+    sarr = cuda.shared.array(shape=sarr_shape, dtype=np.float32)
+
+    # shared array thread index
+    ij_idx = cuda.threadIdx.x + cuda.threadIdx.y * cuda.blockDim.x
+    k_idx = cuda.threadIdx.z
+
+    # thread absolute position
+    i, j, k = cuda.grid(3)
+
+    # stop this thread if outside image boundary
+    if i >= img.shape[0] or j >= img.shape[1] or k >= xa.shape[0]:
+        sarr[ij_idx, k_idx] = 0.0
+        return
+
+    # set this element in the shared array to the opacity value of this pixel
+    sarr[ij_idx, k_idx] = img[i, j]
+
+    # proceed with the following block only if there is nonzero opacity of this
+    # pixel
+    if sarr[ij_idx, k_idx] > 0.0:
+
+        # calculate the four relevant pixel positions relative to the planet
+        # centre, running clockwise from the upper right quadrant (the opacity
+        # image is only one quadrant and biaxial symmetry is assumed).
+        x0 = (j + 0.5) * pxsize  # x upper right quadrant
+        y0 = (i + 0.5) * pxsize  # y upper right quadrant
+        x1 = x0  # x lower right quadrant
+        y1 = -y0  # y lower right quadrant
+        x2 = -x0  # x upper left quadrant
+        y2 = -y0  # y upper left quadrant
+        x3 = -x0  # x lower left quadrant
+        y3 = y0  # y lower left quadrant
+
+        # cosine and sine of the obliquity
+        c_oblq, s_oblq = cos(oblqty), sin(oblqty)
+        # rotate and scale the pixel positions to units of stellar radii
+        _x0 = (x0 * c_oblq - y0 * s_oblq) * prad
+        _y0 = (x0 * s_oblq + y0 * c_oblq) * prad
+        _x1 = (x1 * c_oblq - y1 * s_oblq) * prad
+        _y1 = (x1 * s_oblq + y1 * c_oblq) * prad
+        _x2 = (x2 * c_oblq - y2 * s_oblq) * prad
+        _y2 = (x2 * s_oblq + y2 * c_oblq) * prad
+        _x3 = (x3 * c_oblq - y3 * s_oblq) * prad
+        _y3 = (x3 * s_oblq + y3 * c_oblq) * prad
+
+        # calculate the area of each pixel in stellar radii squared, multiply
+        # this into the light curve contribution of the shared array
+        sarr[ij_idx, k_idx] *= ((pxsize * prad) ** 2)
+
+        # read the x and y offsets for this light curve point
+        # the compiler should be good enough to not do this multiple times if
+        # placed in the below loop, but just in case it's not...
+        x_off = xa[k]
+        y_off = ya[k]
+
+        # sum of stellar intensities covered by these four pixels
+        _intensity_sum = 0.0
+
+        # for each pixel
+        for xx, yy in [(_x0, _y0), (_x1, _y1), (_x2, _y2), (_x3, _y3)]:
+
+            # calculate its radius at this light curve point
+            rad = ((xx + x_off) ** 2 + (yy + y_off) ** 2) ** 0.5
+
+            # if it's on the star, calculate the intensity of the star at this
+            # position and include it in the sum
+            if rad <= 1.0:
+                mu = 1.0 - cos(asin(rad))
+                fr = ((1 - ld_a * mu - ld_b * mu ** 2)
+                      / (1 - ld_a / 3 - ld_b / 6) / pi)
+                _intensity_sum += fr
+
+        # multiply in the blocked stellar intensity to the light curve
+        # contribution
+        sarr[ij_idx, k_idx] *= _intensity_sum
+
+    # sync all threads in this block
+    cuda.syncthreads()
+
+    # array sum reduction
+    for ll in range(log2(sarr_shape[0]), -1, -1):
+        lim = 1 << ll
+        if ij_idx < lim:
+            sarr[ij_idx, k_idx] += sarr[ij_idx + lim, k_idx]
+        cuda.syncthreads()
+
+    # fill the block result element with the sum
+    if ij_idx == 0:
+        blkidx = cuda.blockIdx.x + cuda.blockIdx.y * cuda.gridDim.x
+        bres[k, blkidx] = sarr[0, k_idx]
+
+
+@cuda.jit
+def _sum_lc_contrib(inarray, outarray):
+    """
+    A sum reduction of a two dimensional input array along axis 1 into a one
+    dimensional output array.
+
+    Parameters
+    ----------
+    inarray : ndarray
+        Input numpy array of shape (N,M).
+    outarray : ndarray
+        Output numpy array of shape (N,).
+
+    Todo
+    ----
+    This method would benefit from some tweaking to improve GPU utilisation.
+    Mainly it will improve performance a little, but it will also stop the
+    annoying NumbaPerformanceWarning.
+    """
+    i = cuda.grid(1)
+    # quit if out of bounds
+    if i > inarray.shape[0]:
+        return
+
+    # 1 - sum of all the elements in this row
+    _tmp = 1.0
+    for j in range(inarray.shape[1]):
+        _tmp -= inarray[i, j]
+
+    # send the result to the output array
+    outarray[i] = _tmp
+
+
+@cuda.jit
+def _fill_image_gpu(image, pixsize,
+                    ir_min, ir_maj, or_min, or_maj, op,
+                    ssf, ss_gap, ss_cont):
+    """
+    Fill the opacity grid array elements with a planet-plus-ring on the gpu.
+
+    Parameters
+    ----------
     image : ndarray
-        image array
-    gamma : float
-        inclination
-    i_r : float
-        ring inner radius
-    o_r : float
-        ring outer radius
+        the image array
+    pixsize : float
+        the pixel size in planetary radii
+    ir_min : float
+        minor axis radius of ring inner edge
+    ir_maj : float
+        major axis radius of ring inner edge
+    or_min : float
+        minor axis radius of ring outer edge
+    or_maj : float
+        major axis radius of ring outer edge
     op : float
         ring opacity
-    ssf : int, optional
-        super-sample factor (default 10)
-
-    Returns
-    -------
-    filled opacity grid image
+    ssf : int
+        super sample factor
+    ss_gap : float
+        the size of a super-sample element in planetary radii
+    ss_cont : float
+        the fractional contribution of a super sample element to its pixel
     """
-    # obtain some array shape information
-    isize, jsize = image.shape
-    ihalf = isize // 2
-    jhalf = jsize // 2
+    # cuda iterator
+    i, j = cuda.grid(2)
+    if i < image.shape[0] and j < image.shape[1]:
+        # fill this element
 
-    # the pixel size in planetary radii (assuming square pixels)
-    pixsize = float(xgrid[0, 1] - xgrid[0, 0])
-    half_pixsize = pixsize * 0.5
+        # calculate the positions of the vertices of the pixel
+        x_i = j * pixsize  # x inner
+        x_o = (j + 1) * pixsize  # x outer
+        y_i = i * pixsize  # y inner
+        y_o = (i + 1) * pixsize  # y outer
+        # pixel inner and outer radii
+        px_inner_rad = (x_i ** 2 + y_i ** 2) ** 0.5
+        px_outer_rad = (x_o ** 2 + y_o ** 2) ** 0.5
 
-    # super-sample spacing
-    fssf = float(ssf)
-    ss_gap = pixsize / fssf
-    # super sample pixel contribution
-    ss_cont = fssf ** -2
+        if px_outer_rad <= 1.0:
+            # The radius of the furthest vertex of the pixel is inside the
+            # planet radius, hence the pixel is fully inside the planet and
+            # the opacity is total.
+            value = 1.0
 
-    # the minor axis sized of the inner and outer ring ellipses
-    i_r_min = sin(gamma) * i_r
-    o_r_min = sin(gamma) * o_r
+        elif (px_inner_rad >= 1.0 and
+              ((x_i / ir_maj) ** 2 + (y_i / ir_min) ** 2 >= 1
+               and (x_o / or_maj) ** 2 + (y_o / or_min) ** 2 <= 1)):
+            # The radius of the closest vertex of the pixel is outside the
+            # inner radius of the ring, and the radius of its furthest
+            # vertex is inside the outer radius of the ring. The inner
+            # vertex of the pixel is also outside the planet, Hence the
+            # pixel is fully inside the ring but also fully outside the
+            # planet and its opacity is that of the ring.
+            value = op
 
-    # for each pixel of a single quadrant
-    for i in range(ihalf):
-        for j in range(jhalf):
-            # get the position of the centre of the pixel
-            xpos = xgrid[ihalf + i, jhalf + j]
-            ypos = ygrid[ihalf + i, jhalf + j]
+        elif (px_inner_rad >= 1.0 and
+              ((x_o / ir_maj) ** 2 + (y_o / ir_min) ** 2 <= 1
+               or (x_i / or_maj) ** 2 + (y_i / or_min) ** 2 >= 1)):
+            # The inner vertex of the pixel is outside the planet.
+            # Additionally, the outer vertex of the  pixels is closer than
+            # the inner edge of the ring, or the inner vertex is further
+            # than the outer edge of the ring. This means the pixel is
+            # wholly outside the planet and the ring, hence its opacity
+            # value is zero.
+            value = 0.0
 
-            # positions of the vertices of the pixel
-            x_i = xpos - half_pixsize  # x inner
-            x_o = xpos + half_pixsize  # x outer
-            y_i = ypos - half_pixsize  # y inner
-            y_o = ypos + half_pixsize  # y outer
-            # pixel outer radius
-            px_outer_rad = (x_o ** 2 + y_o ** 2) ** 0.5
-            # pixel inner radius
-            px_inner_rad = (x_i ** 2 + y_i ** 2) ** 0.5
+        else:
+            # The pixel is partially covered by the planet and/or ring and
+            # so we must super-sample the pixel to estimate the appropriate
+            # opacity value for the pixel.
+            value = 0.0
+            for m in range(ssf):
+                for n in range(ssf):
+                    # central position of super sample pixel
+                    _xp = x_i + (0.5 + m) * ss_gap
+                    _yp = y_i + (0.5 + n) * ss_gap
 
-            if px_outer_rad <= 1.0:
-                # The radius of the furthest vertex of the pixel is inside the
-                # planet radius, hence the pixel is fully inside the planet and
-                # the opacity is total.
-                value = 1.0
+                    if (_xp ** 2 + _yp ** 2) ** 0.5 < 1.0:
+                        # the super sample pixel centre is on the planet
+                        value = value + ss_cont
 
-            elif (px_inner_rad >= 1.0 and
-                  ((x_i / i_r) ** 2 + (y_i / i_r_min) ** 2 >= 1
-                   and (x_o / o_r) ** 2 + (y_o / o_r_min) ** 2 <= 1)):
-                # The radius of the closest vertex of the pixel is outside the
-                # inner radius of the ring, and the radius of its furthest
-                # vertex is inside the outer radius of the ring. The inner
-                # vertex of the pixel is also outside the planet, Hence the
-                # pixel is fully inside the ring but also fully outside the
-                # planet and its opacity is that of the ring.
-                value = op
+                    elif ((_xp / ir_maj) ** 2 + (_yp / ir_min) ** 2 >= 1 and
+                          (_xp / or_maj) ** 2 + (_yp / or_min) ** 2 < 1):
+                        # the super sample pixel centre is on the ring
+                        value = value + op * ss_cont
 
-            elif (px_inner_rad >= 1.0 and
-                  ((x_o / i_r) ** 2 + (y_o / i_r_min) ** 2 <= 1
-                   or (x_i / o_r) ** 2 + (y_i / o_r_min) ** 2 >= 1)):
-                # The inner vertex of the pixel is outside the planet.
-                # Additionally, the outer vertex of the  pixels is closer than
-                # the inner edge of the ring, or the inner vertex is further
-                # than the outer edge of the ring. This means the pixel is
-                # wholly outside the planet and the ring, hence its opacity
-                # value is zero.
-                value = 0.0
-
-            else:
-                # The pixel is partially covered by the planet and/or ring and
-                # so we must super-sample the pixel to estimate the appropriate
-                # opacity value for the pixel.
-                value = 0.0
-                for m in range(ssf):
-                    for n in range(ssf):
-                        # central position of super sample pixel
-                        _xp = x_i + (0.5 + m) * ss_gap
-                        _yp = y_i + (0.5 + n) * ss_gap
-
-                        if (_xp ** 2 + _yp ** 2) ** 0.5 < 1.0:
-                            # the super sample pixel centre is on the planet
-                            value = value + ss_cont
-
-                        elif ((_xp / i_r) ** 2 + (_yp / i_r_min) ** 2 >= 1
-                              and
-                              (_xp / o_r) ** 2 + (_yp / o_r_min) ** 2 < 1):
-                            # the super sample pixel centre is on the ring
-                            value = value + op * ss_cont
-
-            # send the value to the four relevant places in the image
-            image[ihalf + i, jhalf + j] = value
-            image[ihalf - i - 1, jhalf + j] = value
-            image[ihalf + i, jhalf - j - 1] = value
-            image[ihalf - i - 1, jhalf - j - 1] = value
-
-    return image
-
-
-@njit(parallel=True)
-def _fill_opacity_grid(xgrid, ygrid, image, gamma, i_rs, o_rs, ops, ssf=10):
-    """
-    Fill an opacity grid image with a planet and multiple rings.
-
-    Parameters
-    ----------
-    xgrid : ndarray
-        x grid coordinates
-    ygrid : ndarray
-        y grid coordinates
-    image : ndarray
-        image array
-    gamma : float
-        inclination
-    i_rs : ndarray
-        ring inner radii
-    o_rs : ndarray
-        ring outer radii
-    ops : ndarray
-        ring opacities
-    ssf : int, optional
-        super-sample factor (default 10)
-
-    Returns
-    -------
-    filled opacity grid image
-    """
-    # obtain some array shape information
-    isize, jsize = image.shape
-    ihalf = isize // 2
-    jhalf = jsize // 2
-
-    # the pixel size in planetary radii (assuming square pixels)
-    pixsize = float(xgrid[0, 1] - xgrid[0, 0])
-    half_pixsize = pixsize * 0.5
-
-    # super-sample spacing
-    fssf = float(ssf)
-    ss_gap = pixsize / fssf
-    # super sample pixel contribution
-    ss_cont = fssf ** -2
-
-    # the minor axis sizes of the inner and outer ring ellipses
-    i_r_mins = sin(gamma) * i_rs
-    o_r_mins = sin(gamma) * o_rs
-
-    # for each pixel of a single quadrant
-    for i in range(ihalf):
-        for j in range(jhalf):
-            # get the position of the centre of the pixel
-            xpos = xgrid[ihalf + i, jhalf + j]
-            ypos = ygrid[ihalf + i, jhalf + j]
-
-            # positions of the vertices of the pixel
-            x_i = xpos - half_pixsize  # x inner
-            x_o = xpos + half_pixsize  # x outer
-            y_i = ypos - half_pixsize  # y inner
-            y_o = ypos + half_pixsize  # y outer
-            # pixel outer radius
-            px_outer_rad = (x_o ** 2 + y_o ** 2) ** 0.5
-            # pixel inner radius
-            px_inner_rad = (x_i ** 2 + y_i ** 2) ** 0.5
-
-            # set finished flag
-            fin = False
-
-            if not fin and px_outer_rad <= 1.0:
-                # The radius of the furthest vertex of the pixel is inside the
-                # planet radius, hence the pixel is fully inside the planet and
-                # the opacity is total.
-                value = 1.0
-                # no need to continue checking this pixel, set the fin flag True
-                fin = True
-
-            if not fin and px_inner_rad >= 1.0:
-                # for each ring...
-                for n in range(i_rs.size):
-                    if (x_i / i_rs[n]) ** 2 + \
-                            (y_i / i_r_mins[n]) ** 2 >= 1 \
-                            and \
-                            (x_o / o_rs[n]) ** 2 + \
-                            (y_o / o_r_mins[n]) ** 2 <= 1:
-                        # The radius of the closest vertex of the pixel is
-                        # outside the inner radius of the ring, and the radius
-                        # of its furthest vertex is inside the outer radius of
-                        # the ring. The inner vertex of the pixel is also
-                        # outside the planet, Hence the pixel is fully inside
-                        # the ring but also fully outside the planet and its
-                        # opacity is that of the ring.
-                        value = ops[n]
-                        # no need to continue checking this pixel, set the fin
-                        # flag True
-                        fin = True
-                        break
-
-            if not fin and px_inner_rad >= 1.0:
-                # we're not finished yet and the pixel is wholly outside the
-                # planet
-                # flags for where the pixel is wholly outside each ring
-                outside_ring = np.zeros(i_rs.size, dtype=np.bool_)
-                # for each ring...
-                for n in range(i_rs.size):
-                    if (x_o / i_rs[n]) ** 2 + \
-                            (y_o / i_r_mins[n]) ** 2 <= 1 \
-                            or (x_i / o_rs[n]) ** 2 + \
-                            (y_i / o_r_mins[n]) ** 2 >= 1:
-                        # The outer vertex of the pixel is closer than the inner
-                        # edge of the ring, or the inner vertex is further than
-                        # the outer edge of the ring. This means the pixel is
-                        # wholly outside the ring.
-                        outside_ring[n] = True
-
-                if np.all(outside_ring):
-                    # if pixel is wholly outside all rings set the opacity to
-                    # zero
-                    value = 0.0
-                    # no need to continue checking this pixel, set the fin flag
-                    # True
-                    fin = True
-
-            if not fin:
-                # The pixel is partially covered by the planet and/or a ring and
-                # so we must super-sample the pixel to estimate the appropriate
-                # opacity value for the pixel.
-                value = 0.0
-                for m in range(ssf):
-                    for n in range(ssf):
-                        # central position of super sample pixel
-                        _xp = x_i + (0.5 + m) * ss_gap
-                        _yp = y_i + (0.5 + n) * ss_gap
-
-                        if (_xp ** 2 + _yp ** 2) ** 0.5 < 1.0:
-                            # the super sample pixel centre is on the planet
-                            value = value + ss_cont
-
-                        else:
-                            # for each ring...
-                            for n in range(i_rs.size):
-                                if (_xp / i_rs[n]) ** 2 + \
-                                        (_yp / i_r_mins[n]) ** 2 >= 1 \
-                                        and (_xp / o_rs[n]) ** 2 + \
-                                        (_yp / o_r_mins[n]) ** 2 < 1:
-                                    # the super sample pixel centre is on this
-                                    # ring, take its opacity value
-                                    value = value + ops[n] * ss_cont
-                                    # no need to continue checking the rings
-                                    break
-
-            # send the value to the four relevant places in the image
-            image[ihalf + i, jhalf + j] = value
-            image[ihalf - i - 1, jhalf + j] = value
-            image[ihalf + i, jhalf - j - 1] = value
-            image[ihalf - i - 1, jhalf - j - 1] = value
-
-    return image
-
-
-def occult_star(
-        img,
-        xgrid,
-        ygrid,
-        px_area,
-        planet_radius,
-        offset_x,
-        offset_y,
-        obliquity,
-        ld_params
-):
-    """
-    Occult a star by the transparency image, producing a light curve.
-
-    Parameters
-    ----------
-    img : ndarray
-        image array
-    xgrid : ndarray
-        x grid coordinates of the image array
-    ygrid : ndarray
-        y grid coordinates of the image array
-    px_area : float
-        the area of each image grid element
-    planet_radius : float
-        the radius of the planet relative to the radius of the star
-    offset_x : ndarray
-        shape (N,) numpy array containing x offset positions of the planet at
-        the desired times
-    offset_y : float
-        the constant offset position in the y direction
-    obliquity : float
-        the angle of the planet relative to its direction of motion in radians
-    ld_params : tuple
-        length 2 tuple of quadratic limb darkening parameters
-
-    Returns
-    -------
-    lc : ndarray
-        shape (N,) numpy array of the light curve data points
-    """
-    # initialise the light curve
-    lc = np.ones_like(offset_x, dtype=np.float64)
-
-    # populate the light curve
-    lc = _fill_light_curve(
-        lc,
-        img,
-        xgrid,
-        ygrid,
-        px_area,
-        planet_radius,
-        offset_x,
-        offset_y,
-        obliquity,
-        ld_params
-    )
-
-    return lc
-
-
-@njit(parallel=True)
-def _fill_light_curve(
-        lc,
-        img,
-        xgrid,
-        ygrid,
-        px_area,
-        planet_radius,
-        offset_x,
-        offset_y,
-        obliquity,
-        ld_params
-):
-    """
-    Populate a light curve
-
-    Parameters
-    ----------
-    lc : ndarray
-        shape (N,) numpy array to fill with the light curve data
-    img : ndarray
-        image array
-    xgrid : ndarray
-        x grid coordinates of the image array
-    ygrid : ndarray
-        y grid coordinates of the image array
-    px_area : float
-        the area of each image grid element
-    planet_radius : float
-        the radius of the planet relative to the radius of the star
-    offset_x : ndarray
-        shape (N,) numpy array containing x offset positions of the planet at
-        the desired times
-    offset_y : float
-        the constant offset position in the y direction
-    obliquity : float
-        the angle of the planet relative to its direction of motion in radians
-    ld_params : tuple
-        length 2 tuple of quadratic limb darkening parameters
-
-    Returns
-    -------
-    lc : ndarray
-        shape (N,) numpy array of the light curve data points
-    """
-    # check inputs
-    assert lc.shape == offset_x.shape
-    assert img.shape == xgrid.shape
-    assert img.shape == ygrid.shape
-
-    # break out limd darkening parameters
-    ld_a, ld_b = ld_params
-
-    # rotate the opacity mask by the obliquity
-    c_oblq, s_oblq = cos(obliquity), sin(obliquity)
-    _xgrid = xgrid * c_oblq - ygrid * s_oblq
-    _ygrid = xgrid * s_oblq + ygrid * c_oblq
-
-    # scale the opacity mask size
-    _xgrid = _xgrid * planet_radius
-    _ygrid = _ygrid * planet_radius
-    # scale the opacity mask element area
-    _px_area = px_area * planet_radius ** 2
-
-    # apply the y direction positional offset
-    _ygrid += offset_y
-
-    # if the minimum y pixel position is outside the star it will never transit,
-    # return the unchanged lightcurve
-    _miny = np.min(_ygrid)
-    if _miny > 1:
-        return lc
-
-    # max extent in x
-    _maxx = np.max(_xgrid)
-
-    # now for each x offset position
-    for i in range(offset_x.size):
-
-        # skip if the object has no hope of transiting
-        if offset_x[i] - _maxx > 1:
-            continue
-
-        # apply the x offset
-        _xg = _xgrid + offset_x[i]
-
-        # radius of each pixel
-        px_rad = (_xg ** 2 + _ygrid ** 2) ** 0.5
-
-        # numba requires 1d arrays for some operations, ravels are views
-        flat_rad = px_rad.ravel()
-        flat_img = img.ravel()
-
-        # identify pixels that are on the star
-        le1 = np.abs(flat_rad) <= 1.0
-
-        # evaluate limb darkening model for these pixels
-        c_mu = 1.0 - np.cos(np.arcsin(flat_rad[le1]))
-        flat_i = ((1 - ld_a * c_mu - ld_b * c_mu ** 2)
-                  / (1 - ld_a / 3 - ld_b / 6) / np.pi) * _px_area
-
-        # subtract this flux from the light curve point
-        lc[i] = lc[i] - np.sum(flat_img[le1] * flat_i)
-
-    return lc
+        # send the value to the image pixel
+        image[i, j] = value

@@ -310,6 +310,7 @@ def _get_pixel_contrib(xa, ya, img, bres, pxsize, prad, oblqty, ldpars):
 
     # stop this thread if outside image boundary
     if i >= img.shape[0] or j >= img.shape[1] or k >= xa.shape[0]:
+        sarr[ij_idx, k_idx] = 0.0
         return
 
     # set this element in the shared array to the opacity value of this pixel

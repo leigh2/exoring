@@ -5,8 +5,8 @@ import numpy as np
 from math import pi
 from exoring import ExoRing
 
-# multiple of gpu_tpb_lcsum (see gpu_config.cfg) so the light curve size
-# divides evenly into reduction blocks
+# multiple of the default lcsum_block size so the light curve size divides
+# evenly into reduction blocks
 LC_SIZE = 1024
 
 
@@ -212,7 +212,7 @@ def test_get_loglikelihood_without_observed_flux_raises():
 def test_light_curve_size_not_multiple_of_block_size():
     """Regression test for an off-by-one in the light curve reduction kernel
     that overran by one row whenever the light curve size wasn't an exact
-    multiple of gpu_tpb_lcsum."""
+    multiple of lcsum_block."""
     ring = _build(_fast_ring())
     size = LC_SIZE + 17
     x = np.linspace(-2.0, 2.0, size)

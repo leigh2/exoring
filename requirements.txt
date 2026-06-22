@@ -1,3 +1,2 @@
-numba==0.53.1
+pycuda>=2022.1
 numpy==1.20.3
-configobj==5.0.6

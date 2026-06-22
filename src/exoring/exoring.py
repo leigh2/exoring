@@ -1,59 +1,89 @@
 #!/usr/bin/env python3
 
-from configobj import ConfigObj
+import os
+from math import ceil, sin, cos, pi, exp
 import numpy as np
-from math import ceil, sin, cos, asin, pi, log2, exp
-from numba import cuda
-import warnings
+from pycuda.compiler import SourceModule
+from pycuda import gpuarray
 
-# ignore numba performance warnings
-warnings.filterwarnings(
-    "ignore",
-    message=".*will likely result in GPU under utilization due to low occupancy"
-)
+_cu_src = None
+_fill_image_kernel = None
+_pixel_contrib_kernel = None
+_chisq_reduce_kernel = None
 
-# make sure a cuda enabled device is available
-assert cuda.is_available()
 
-# GPU shared array shape must be set at compile time, this means it and it's
-# precursors must be defined here. Read the precursors from a config file, and
-# then define the shape of the shared array.
+def _ensure_kernels():
+    """
+    Compile exoring.cu and fetch its kernel functions, exactly once per
+    process (guarded by the `_cu_src is not None` check below) - module-level
+    globals rather than a per-instance attribute, so that multiple ExoRing
+    instances in the same process all share one compiled module instead of
+    each re-running nvcc.
+    """
+    global _cu_src
+    global _fill_image_kernel, _pixel_contrib_kernel, _chisq_reduce_kernel
+    if _cu_src is not None:
+        return
+    import pycuda.autoinit
+    cu_src_file_path = os.path.join(os.path.dirname(__file__), "exoring.cu")
+    with open(cu_src_file_path, "r") as cu_src_file:
+        _cu_src = SourceModule(
+            cu_src_file.read(), options=["-use_fast_math", "-O3"]
+        )
+    _fill_image_kernel = _cu_src.get_function("fill_image")
+    _pixel_contrib_kernel = _cu_src.get_function("pixel_contrib_accumulate")
+    _chisq_reduce_kernel = _cu_src.get_function("chisq_reduce")
+    _fill_image_kernel.prepare("Piiffffffiff")
+    _pixel_contrib_kernel.prepare("PPiPiiffffffP")
+    _chisq_reduce_kernel.prepare("PPPiP")
 
-# open the config file
-gpu_config = ConfigObj('gpu_config.cfg')
 
-# gpu threads per block for image generation
-gpu_tpb_imgen = tuple([int(f) for f in gpu_config['gpu_tpb_imgen']])
-# gpu threads per block for light curve generation
-gpu_tpb_lcgen = tuple([int(f) for f in gpu_config['gpu_tpb_lcgen']])
-# gpu threads per block for light curve reduction operation
-gpu_tpb_lcsum = gpu_config.as_int('gpu_tpb_lcsum')  # must be set at compile
+def to_gpu(arr, dtype):
+    """
+    Convenience function for sending an array to the gpu with a specific data
+    type.
 
-# verify the tuples are the correct length
-assert len(gpu_tpb_imgen) == 2
-assert len(gpu_tpb_lcgen) == 3
-# todo
-# verify values are powers of 2
+    Parameters
+    ----------
+    arr : array-like
+        The array to send to the gpu
+    dtype : dtype
+        The numpy data type to use
 
-# gpu shared array shape *must* be set at compile time
-sarr_shape = (
-    gpu_tpb_lcgen[0] * gpu_tpb_lcgen[1],
-    gpu_tpb_lcgen[2]
-)
-# log2 of tpb for light curve reduction operations
-log2tpb_lcsum = int(log2(gpu_tpb_lcsum))
+    Returns
+    -------
+    A gpuarray
+    """
+    return gpuarray.to_gpu(np.ascontiguousarray(arr, dtype=dtype))
 
 
 class ExoRing:
     """
     Exoring light curve generation class.
+
+    Typical usage:
+        1. construct an `ExoRing` instance
+        2. `build_image` - builds the opacity mask for a given ring geometry
+           on the device
+        3. `put_xy_array` / `put_observed_lc` - upload the orbit positions and
+           observed light curve once; these stay resident on the device
+        4. `occult_star` - projects the opacity mask onto the star to produce
+           a model light curve, given the current ring geometry's image
+        5. `read_lightcurve` and/or `get_loglikelihood` - read results back
+
+    In an MCMC fit, steps 2 and 4 (and `get_loglikelihood`) are the hot path,
+    repeated every step as the ring geometry parameters change; steps 1 and 3
+    only need to happen once at the start of a run.
     """
 
     def __init__(
             self,
             planet_scale=200,
             super_sample_factor=10,
-            img_array_shape=(512, 1024)
+            img_array_shape=(512, 1024),
+            imgen_block=(32, 32),
+            lcgen_block=(16, 16),
+            lcsum_block=1024
     ):
         """
         Initialise the exoring light curve generation class instance
@@ -70,16 +100,28 @@ class ExoRing:
             dimension. (Default: 10.)
         img_array_shape : tuple, optional
             Tuple of length 2, dictating the shape of the on-device image array
-            in which to build the opacity images. Each dimension size should be
-            a power of two. (Default: (512, 1024).)
+            in which to build the opacity images. (Default: (512, 1024).)
+        imgen_block : tuple, optional
+            CUDA threads-per-block (2D) for the opacity image generation
+            kernel. (Default: (32, 32).)
+        lcgen_block : tuple, optional
+            CUDA threads-per-block (2D) for the light curve generation kernel
+            - each thread covers one opacity-image pixel and internally loops
+            over every light curve point. `lcgen_block[0] * lcgen_block[1]`
+            must be a multiple of 32. (Default: (16, 16).)
+        lcsum_block : int, optional
+            CUDA threads-per-block for the chi-square reduction kernel.
+            (Default: 1024.)
         """
-        # todo
-        # verify values are powers of 2
+        _ensure_kernels()
 
         # verify img_array_shape is the correct length
         assert len(img_array_shape) == 2
         # verify that the planet fits in the device image array
         assert planet_scale <= img_array_shape[0]
+        # the (i,j)-plane block size must be a whole number of warps so that
+        # the warp-shuffle reduction in pixel_contrib_accumulate is valid
+        assert (lcgen_block[0] * lcgen_block[1]) % 32 == 0
 
         # pixel scale, i.e. number of image array elements per planet radius
         self.planet_scale = planet_scale
@@ -90,40 +132,56 @@ class ExoRing:
         # in which to split each image array element when evaluating the mean
         # opacity of an element which spans a ring or planet edge
         self.super_sample_factor = super_sample_factor
-        # super-sample spacing
         fssf = float(self.super_sample_factor)
         self.ss_gap = self.pixel_size / fssf
-        # super sample pixel contribution
         self.ss_cont = fssf ** -2
 
-        # gpu threads per block for image generation
-        self.gpu_tpb_imgen = gpu_tpb_imgen
-        # opacity image array
+        # opacity image array, on the device
         self.img_array_shape = img_array_shape
-        # gpu blocks per grid for image generation
-        self.gpu_bpg_imgen = (
-            ceil(img_array_shape[0] / gpu_tpb_imgen[0]),
-            ceil(img_array_shape[1] / gpu_tpb_imgen[1])
+        self.img_array = gpuarray.zeros(img_array_shape, dtype=np.float32)
+
+        # fill_image launch configuration, cached since the image shape is
+        # fixed for the life of this instance. blockIdx.x/threadIdx.x track
+        # columns and blockIdx.y/threadIdx.y track rows (not the other way
+        # round) so that the kernel's image reads/writes are coalesced - see
+        # the comment in exoring.cu
+        self.imgen_block = (int(imgen_block[0]), int(imgen_block[1]), 1)
+        self.imgen_grid = (
+            ceil(img_array_shape[1] / imgen_block[0]),
+            ceil(img_array_shape[0] / imgen_block[1]),
+            1
         )
 
-        # open the image array on the device
-        # 32 bit floats should be sufficient for a final precision a little
-        # better than 0.1 ppm
-        self.img_array = cuda.device_array(img_array_shape, dtype=np.float32)
+        # pixel_contrib_accumulate launch configuration. One thread per
+        # opacity-image pixel (it internally loops over every light curve
+        # point - see exoring.cu), so like imgen_grid this only depends on
+        # the image shape, not on the light curve size.
+        self.lcgen_block = (int(lcgen_block[0]), int(lcgen_block[1]), 1)
+        self.lcgen_grid = (
+            ceil(img_array_shape[1] / lcgen_block[0]),
+            ceil(img_array_shape[0] / lcgen_block[1]),
+            1
+        )
+        n_warps_lcgen = (lcgen_block[0] * lcgen_block[1] + 31) // 32
+        self._lcgen_smem = n_warps_lcgen * 8  # bytes (float64 per warp)
 
-        # gpu threads per block for light curve generation
-        self.gpu_tpb_lcgen = gpu_tpb_lcgen
-        # gpu threads per block for light curve reduction operation
-        self.gpu_tpb_lcsum = gpu_tpb_lcsum
+        # chisq_reduce launch configuration
+        self.lcsum_block = int(lcsum_block)
+        n_warps_lcsum = (lcsum_block + 31) // 32
+        self._lcsum_smem = n_warps_lcsum * 8  # bytes (float64 per warp)
 
         # initialise some instance variables
         self.x_array = None
         self.y_array = None
+        self.n_pts = None
         self.flux = None
         self.flux_error = None
-        self.lc = None
-        self.bpg_lc_reduction = None
-        self._tmp = None
+        self.lc_accum = None
+        self._chisq = None
+
+        # blocks per grid for the lc reduction kernel, set once the light
+        # curve size is known (see put_xy_array)
+        self.lcsum_grid = None
 
     def put_xy_array(self, xarray, yarray):
         """
@@ -132,10 +190,10 @@ class ExoRing:
 
         Parameters
         ----------
-        x_array : ndarray
+        xarray : ndarray
             1D Numpy array of (N,) 'X' positions of the centre of the planet
             relative to the centre of the star in units of stellar radii.
-        y_array : ndarray
+        yarray : ndarray
             1D Numpy array of (N,) 'Y' positions of the centre of the planet
             relative to the centre of the star in units of stellar radii.
         """
@@ -143,8 +201,14 @@ class ExoRing:
         assert xarray.shape == yarray.shape
         assert len(xarray.shape) == 1
         # send arrays to device
-        self.x_array = cuda.to_device(xarray)
-        self.y_array = cuda.to_device(yarray)
+        self.x_array = to_gpu(xarray, np.float64)
+        self.y_array = to_gpu(yarray, np.float64)
+        self.n_pts = xarray.size
+
+        # blocks per grid for the lc reduction kernel (lcgen_grid is fixed at
+        # construction time - see __init__ - since it no longer depends on
+        # the light curve size)
+        self.lcsum_grid = (ceil(self.n_pts / self.lcsum_block), 1, 1)
 
     def put_observed_lc(self, flux, flux_error):
         """
@@ -162,11 +226,8 @@ class ExoRing:
         assert flux.shape == flux_error.shape
         assert len(flux.shape) == 1
         # send arrays to device
-        self.flux = cuda.to_device(flux)
-        self.flux_error = cuda.to_device(flux_error)
-        # a temporary global array to be used for lightcurve reductions
-        self.bpg_lc_reduction = ceil(flux.size / gpu_tpb_lcsum)
-        self._tmp = cuda.device_array(self.bpg_lc_reduction, dtype=np.float64)
+        self.flux = to_gpu(flux, np.float64)
+        self.flux_error = to_gpu(flux_error, np.float64)
 
     def build_image(self,
                     inner_ring_radius, outer_ring_radius,
@@ -176,11 +237,11 @@ class ExoRing:
 
         Parameters
         ----------
-        inner_ring_radius : float or array-like
+        inner_ring_radius : float
             The inner radius of the ring in units of planet radii.
-        outer_ring_radius : float or array-like
+        outer_ring_radius : float
             The outer radius of the ring in units of planet radii.
-        ring_optical_depth : float or array-like
+        ring_optical_depth : float
             The normal optical depth of the ring.
         gamma : float
             Inclination angle relative to the line of sight to the observer in
@@ -188,7 +249,7 @@ class ExoRing:
             depth is not modelled.
         """
         # sin gamma
-        singamma = sin(gamma % (0.5*pi))
+        singamma = sin(gamma % (0.5 * pi))
 
         # verify that the ring fits in the device image array
         assert self.planet_scale * outer_ring_radius <= self.img_array_shape[1]
@@ -205,11 +266,17 @@ class ExoRing:
         i_r_min = singamma * inner_ring_radius
         o_r_min = singamma * outer_ring_radius
 
-        # fill the image array on the gpu
-        _fill_image_gpu[self.gpu_bpg_imgen, self.gpu_tpb_imgen](
-            self.img_array, self.pixel_size, i_r_min, inner_ring_radius,
-            o_r_min, outer_ring_radius, ring_opacity, self.super_sample_factor,
-            self.ss_gap, self.ss_cont
+        _fill_image_kernel.prepared_call(
+            self.imgen_grid, self.imgen_block,
+            self.img_array.gpudata,
+            np.int32(self.img_array_shape[0]),
+            np.int32(self.img_array_shape[1]),
+            np.float32(self.pixel_size),
+            np.float32(i_r_min), np.float32(inner_ring_radius),
+            np.float32(o_r_min), np.float32(outer_ring_radius),
+            np.float32(ring_opacity),
+            np.int32(self.super_sample_factor),
+            np.float32(self.ss_gap), np.float32(self.ss_cont)
         )
 
     def read_image(self, return_full=True):
@@ -231,13 +298,10 @@ class ExoRing:
         both dimensions (in which case it is twice `img_array_shape` in each
         dimension).
         """
-        # grab the single quadrant array from the gpu
-        img1q = self.img_array.copy_to_host()
+        img1q = self.img_array.get()
         if not return_full:
-            # return the single quadrant
             return img1q
         else:
-            # mirror about both axis
             img4q = np.block([
                 [np.flip(img1q), np.flip(img1q, axis=0)],
                 [np.flip(img1q, axis=1), img1q]
@@ -252,17 +316,12 @@ class ExoRing:
         -------
         k
         """
-        # read the image from the device, only the primary quadrant is needed
         img = self.read_image(return_full=False)
 
-        # sum of opacity elements in this single quadrant
         total_opacity = img.sum()
-        # the sum of the opacity elements contributed by the planet in this
-        # quadrant
-        planet_opacity = 0.25 * pi * self.planet_scale**2
+        planet_opacity = 0.25 * pi * self.planet_scale ** 2
 
-        # calculate the radius scaling factor parameter
-        k = (total_opacity / planet_opacity)**0.5
+        k = (total_opacity / planet_opacity) ** 0.5
 
         return k
 
@@ -284,40 +343,32 @@ class ExoRing:
 
         Returns
         -------
-        1D numpy array of (N,) fractional flux values relative to baseline for
-        the requested 'X' and 'Y' positions.
+        None. Use `read_lightcurve` to retrieve the model light curve.
         """
         if self.x_array is None or self.y_array is None:
             raise RuntimeError("Can't produce light curve as x_array and/or "
                                "y_array is empty")
 
-        # open an output lightcurve array on the device
-        self.lc = cuda.device_array(self.x_array.size, dtype=np.float32)
+        ld_a, ld_b = ld_params
+        # obliquity is the same for every thread in this launch, so its
+        # cosine/sine are computed once here rather than recomputed by every
+        # thread on the device
+        c_oblq, s_oblq = cos(obliquity), sin(obliquity)
 
-        # blocks per grid for the lc generation
-        gpu_bpg_lcgen = (
-            ceil(self.img_array_shape[0] / self.gpu_tpb_lcgen[0]),
-            ceil(self.img_array_shape[1] / self.gpu_tpb_lcgen[1]),
-            ceil(self.x_array.size / self.gpu_tpb_lcgen[2])
-        )
+        # (re)initialise the light curve accumulator
+        self.lc_accum = gpuarray.zeros(self.n_pts, dtype=np.float64)
 
-        # open a temporary array on the device to put the per-block results in
-        _block_results = cuda.device_array(
-            (self.x_array.size, gpu_bpg_lcgen[0] * gpu_bpg_lcgen[1]),
-            dtype=np.float32
-        )
-
-        # pixel contribution calculation
-        _get_pixel_contrib[gpu_bpg_lcgen, self.gpu_tpb_lcgen](
-            self.x_array, self.y_array, self.img_array, _block_results,
-            self.pixel_size, planet_radius, obliquity, ld_params
-        )
-
-        # reduce the block results to produce the lightcurve using:
-        # delta_flux = 1 - sum(_block_results, axis=1)
-        gpu_bpg_lcsum = ceil(self.x_array.size / self.gpu_tpb_lcsum)
-        _sum_lc_contrib[gpu_bpg_lcsum, self.gpu_tpb_lcsum](
-            _block_results, self.lc
+        _pixel_contrib_kernel.prepared_call(
+            self.lcgen_grid, self.lcgen_block,
+            self.x_array.gpudata, self.y_array.gpudata, np.int32(self.n_pts),
+            self.img_array.gpudata,
+            np.int32(self.img_array_shape[0]),
+            np.int32(self.img_array_shape[1]),
+            np.float32(self.pixel_size), np.float32(planet_radius),
+            np.float32(c_oblq), np.float32(s_oblq),
+            np.float32(ld_a), np.float32(ld_b),
+            self.lc_accum.gpudata,
+            shared_size=self._lcgen_smem
         )
 
     def read_lightcurve(self):
@@ -328,12 +379,12 @@ class ExoRing:
         -------
         The model light curve.
         """
-        if self.lc is None:
+        if self.lc_accum is None:
             raise RuntimeError(
                 "model lightcurve array is empty, can't copy from device"
             )
         else:
-            return self.lc.copy_to_host()
+            return 1.0 - self.lc_accum.get()
 
     def get_loglikelihood(self):
         """
@@ -344,7 +395,7 @@ class ExoRing:
         -------
         The log-likelihood of the model given the data.
         """
-        if self.lc is None:
+        if self.lc_accum is None:
             raise RuntimeError(
                 "model lightcurve array is empty, can't compute log likelihood"
             )
@@ -356,351 +407,17 @@ class ExoRing:
             raise RuntimeError(
                 "flux errors not provided, can't compute log likelihood"
             )
-        elif self._tmp is None:
-            raise RuntimeError(
-                "_tmp array does not exist, can't compute log likelihood"
-            )
         else:
-            # open a single element chisq array on the device
-            _chisq = cuda.to_device(np.zeros(1, dtype=np.float64))
+            self._chisq = gpuarray.zeros(1, dtype=np.float64)
 
-            # compute the chisq into the temporary array
-            _get_chisq[self.bpg_lc_reduction, self.gpu_tpb_lcsum](
-                self.lc, self.flux, self.flux_error, self._tmp
+            _chisq_reduce_kernel.prepared_call(
+                self.lcsum_grid, (self.lcsum_block, 1, 1),
+                self.lc_accum.gpudata,
+                self.flux.gpudata, self.flux_error.gpudata,
+                np.int32(self.n_pts), self._chisq.gpudata,
+                shared_size=self._lcsum_smem
             )
 
-            # final sum reduction using atomic operations to get a single chisq
-            # value
-            _bpg = ceil(self._tmp.size / self.gpu_tpb_lcsum)
-            _atomic_sum[_bpg, self.gpu_tpb_lcsum](self._tmp, _chisq)
+            chisq = self._chisq.get()[0]
 
-            # copy the single-element chisq array from the device and extract it
-            chisq = _chisq.copy_to_host()[0]
-
-            # return the log likelihood
             return -0.5 * chisq
-
-
-@cuda.jit
-def _get_chisq(model, flux, error, out_array):
-    # open a working array in shared memory
-    sarr = cuda.shared.array(shape=(gpu_tpb_lcsum,), dtype=np.float64)
-
-    # shared array thread index
-    sarr_idx = cuda.threadIdx.x
-
-    # global thread index
-    i = cuda.grid(1)
-
-    if i >= model.size:
-        # add nothing if thread is out of bounds
-        sarr[sarr_idx] = 0.0
-    else:
-        # read the contribution of this element into shared memory
-        sarr[sarr_idx] = ((flux[i] - model[i]) / error[i]) ** 2
-
-    # sync all threads in this block
-    cuda.syncthreads()
-
-    # now perform an array sum reduction
-    for ll in range(log2tpb_lcsum - 1, -1, -1):
-        lim = 1 << ll
-        if sarr_idx < lim:
-            sarr[sarr_idx] += sarr[sarr_idx + lim]
-        cuda.syncthreads()
-
-    # send this contribution to the temporary array
-    if sarr_idx == 0:
-        out_array[cuda.blockIdx.x] = sarr[0]
-
-
-@cuda.jit
-def _atomic_sum(inarray, outarray):
-    # open a working array in shared memory
-    sarr = cuda.shared.array(shape=(gpu_tpb_lcsum,), dtype=np.float64)
-    # shared array thread index
-    sarr_idx = cuda.threadIdx.x
-    # global thread index
-    i = cuda.grid(1)
-
-    if i >= inarray.size:
-        # add nothing if thread is out of bounds
-        sarr[sarr_idx] = 0.0
-    else:
-        # read the contribution of this element into shared memory
-        sarr[sarr_idx] = inarray[i]
-
-    # sync all threads in this block
-    cuda.syncthreads()
-
-    # now perform an array sum reduction
-    for ll in range(log2tpb_lcsum - 1, -1, -1):
-        lim = 1 << ll
-        if sarr_idx < lim:
-            sarr[sarr_idx] += sarr[sarr_idx + lim]
-        cuda.syncthreads()
-
-    # atomic adds are done serially to avoid race conditions, but provided not
-    # too many need to be done this is ok. In our case it need only be done once
-    # per block. Even a 2 year at 25s integration light curve need only do ~2500
-    # atomic adds with 1024 threads per block.
-
-    # atomic add this contribution to the chisq value
-    if sarr_idx == 0:
-        cuda.atomic.add(outarray, 0, sarr[0])
-
-
-@cuda.jit
-def _get_pixel_contrib(xa, ya, img, bres, pxsize, prad, oblqty, ldpars):
-    """
-    Evaluate the fraction of flux blocked for each opacity grid element for each
-    planet position point. Run a first pass sum reduction to reduce the
-    resultant large 3D grid to a smaller 2D grid.
-
-    Parameters
-    ----------
-    xa : ndarray
-        1D array of (N,) 'X' positions of the centre of the planet relative to
-        the centre of the star in units of stellar radii.
-    ya : ndarray
-        1D array of (N,) 'Y' positions of the centre of the planet relative to
-        the centre of the star in units of stellar radii.
-    img : ndarray
-        2D opacity grid array.
-    bres : ndarray
-        Temporary 2D array in which to place the result of the first pass sum
-        reduction.
-    pxsize : float
-        The size of each opacity array element in units of planetary radii
-        squared.
-    prad : float
-        The radius of the planet in units of stellar radii.
-    oblqty : float
-        The inclination in radians of the planet in the plane of its orbit. Runs
-        clockwise, positive from zero parallel to the 'X' axis.
-    ldpars : tuple
-        Tuple of two quadratic limb darkening parameters for the star
-    """
-    # break out the limb darkening parameters
-    ld_a, ld_b = ldpars
-
-    # open a working array in shared memory
-    sarr = cuda.shared.array(shape=sarr_shape, dtype=np.float32)
-
-    # shared array thread index
-    ij_idx = cuda.threadIdx.x + cuda.threadIdx.y * cuda.blockDim.x
-    k_idx = cuda.threadIdx.z
-
-    # thread absolute position
-    i, j, k = cuda.grid(3)
-
-    # stop this thread if outside image boundary
-    if i >= img.shape[0] or j >= img.shape[1] or k >= xa.shape[0]:
-        sarr[ij_idx, k_idx] = 0.0
-        return
-
-    # set this element in the shared array to the opacity value of this pixel
-    sarr[ij_idx, k_idx] = img[i, j]
-
-    # proceed with the following block only if there is nonzero opacity of this
-    # pixel
-    if sarr[ij_idx, k_idx] > 0.0:
-
-        # calculate the four relevant pixel positions relative to the planet
-        # centre, running clockwise from the upper right quadrant (the opacity
-        # image is only one quadrant and biaxial symmetry is assumed).
-        x0 = (j + 0.5) * pxsize  # x upper right quadrant
-        y0 = (i + 0.5) * pxsize  # y upper right quadrant
-        x1 = x0  # x lower right quadrant
-        y1 = -y0  # y lower right quadrant
-        x2 = -x0  # x upper left quadrant
-        y2 = -y0  # y upper left quadrant
-        x3 = -x0  # x lower left quadrant
-        y3 = y0  # y lower left quadrant
-
-        # cosine and sine of the obliquity
-        c_oblq, s_oblq = cos(oblqty), sin(oblqty)
-        # rotate and scale the pixel positions to units of stellar radii
-        _x0 = (x0 * c_oblq - y0 * s_oblq) * prad
-        _y0 = (x0 * s_oblq + y0 * c_oblq) * prad
-        _x1 = (x1 * c_oblq - y1 * s_oblq) * prad
-        _y1 = (x1 * s_oblq + y1 * c_oblq) * prad
-        _x2 = (x2 * c_oblq - y2 * s_oblq) * prad
-        _y2 = (x2 * s_oblq + y2 * c_oblq) * prad
-        _x3 = (x3 * c_oblq - y3 * s_oblq) * prad
-        _y3 = (x3 * s_oblq + y3 * c_oblq) * prad
-
-        # calculate the area of each pixel in stellar radii squared, multiply
-        # this into the light curve contribution of the shared array
-        sarr[ij_idx, k_idx] *= ((pxsize * prad) ** 2)
-
-        # read the x and y offsets for this light curve point
-        # the compiler should be good enough to not do this multiple times if
-        # placed in the below loop, but just in case it's not...
-        x_off = xa[k]
-        y_off = ya[k]
-
-        # sum of stellar intensities covered by these four pixels
-        _intensity_sum = 0.0
-
-        # for each pixel
-        for xx, yy in [(_x0, _y0), (_x1, _y1), (_x2, _y2), (_x3, _y3)]:
-
-            # calculate its radius at this light curve point
-            rad = ((xx + x_off) ** 2 + (yy + y_off) ** 2) ** 0.5
-
-            # if it's on the star, calculate the intensity of the star at this
-            # position and include it in the sum
-            if rad <= 1.0:
-                mu = 1.0 - cos(asin(rad))
-                fr = ((1 - ld_a * mu - ld_b * mu ** 2)
-                      / (1 - ld_a / 3 - ld_b / 6) / pi)
-                _intensity_sum += fr
-
-        # multiply in the blocked stellar intensity to the light curve
-        # contribution
-        sarr[ij_idx, k_idx] *= _intensity_sum
-
-    # sync all threads in this block
-    cuda.syncthreads()
-
-    # array sum reduction
-    for ll in range(log2(sarr_shape[0]), -1, -1):
-        lim = 1 << ll
-        if ij_idx < lim:
-            sarr[ij_idx, k_idx] += sarr[ij_idx + lim, k_idx]
-        cuda.syncthreads()
-
-    # fill the block result element with the sum
-    if ij_idx == 0:
-        blkidx = cuda.blockIdx.x + cuda.blockIdx.y * cuda.gridDim.x
-        bres[k, blkidx] = sarr[0, k_idx]
-
-
-@cuda.jit
-def _sum_lc_contrib(inarray, outarray):
-    """
-    A sum reduction of a two dimensional input array along axis 1 into a one
-    dimensional output array.
-
-    Parameters
-    ----------
-    inarray : ndarray
-        Input numpy array of shape (N,M).
-    outarray : ndarray
-        Output numpy array of shape (N,).
-
-    Todo
-    ----
-    This method would benefit from some tweaking to improve GPU utilisation.
-    Mainly it will improve performance a little, but it will also stop the
-    annoying NumbaPerformanceWarning.
-    """
-    i = cuda.grid(1)
-    # quit if out of bounds
-    if i >= inarray.shape[0]:
-        return
-
-    # 1 - sum of all the elements in this row
-    _tmp = 1.0
-    for j in range(inarray.shape[1]):
-        _tmp -= inarray[i, j]
-
-    # send the result to the output array
-    outarray[i] = _tmp
-
-
-@cuda.jit
-def _fill_image_gpu(image, pixsize,
-                    ir_min, ir_maj, or_min, or_maj, op,
-                    ssf, ss_gap, ss_cont):
-    """
-    Fill the opacity grid array elements with a planet-plus-ring on the gpu.
-
-    Parameters
-    ----------
-    image : ndarray
-        the image array
-    pixsize : float
-        the pixel size in planetary radii
-    ir_min : float
-        minor axis radius of ring inner edge
-    ir_maj : float
-        major axis radius of ring inner edge
-    or_min : float
-        minor axis radius of ring outer edge
-    or_maj : float
-        major axis radius of ring outer edge
-    op : float
-        ring opacity
-    ssf : int
-        super sample factor
-    ss_gap : float
-        the size of a super-sample element in planetary radii
-    ss_cont : float
-        the fractional contribution of a super sample element to its pixel
-    """
-    # cuda iterator
-    i, j = cuda.grid(2)
-    if i < image.shape[0] and j < image.shape[1]:
-        # fill this element
-
-        # calculate the positions of the vertices of the pixel
-        x_i = j * pixsize  # x inner
-        x_o = (j + 1) * pixsize  # x outer
-        y_i = i * pixsize  # y inner
-        y_o = (i + 1) * pixsize  # y outer
-        # pixel inner and outer radii
-        px_inner_rad = (x_i ** 2 + y_i ** 2) ** 0.5
-        px_outer_rad = (x_o ** 2 + y_o ** 2) ** 0.5
-
-        if px_outer_rad <= 1.0:
-            # The radius of the furthest vertex of the pixel is inside the
-            # planet radius, hence the pixel is fully inside the planet and
-            # the opacity is total.
-            value = 1.0
-
-        elif (px_inner_rad >= 1.0 and
-              ((x_i / ir_maj) ** 2 + (y_i / ir_min) ** 2 >= 1
-               and (x_o / or_maj) ** 2 + (y_o / or_min) ** 2 <= 1)):
-            # The radius of the closest vertex of the pixel is outside the
-            # inner radius of the ring, and the radius of its furthest
-            # vertex is inside the outer radius of the ring. The inner
-            # vertex of the pixel is also outside the planet, Hence the
-            # pixel is fully inside the ring but also fully outside the
-            # planet and its opacity is that of the ring.
-            value = op
-
-        elif (px_inner_rad >= 1.0 and
-              ((x_o / ir_maj) ** 2 + (y_o / ir_min) ** 2 <= 1
-               or (x_i / or_maj) ** 2 + (y_i / or_min) ** 2 >= 1)):
-            # The inner vertex of the pixel is outside the planet.
-            # Additionally, the outer vertex of the  pixels is closer than
-            # the inner edge of the ring, or the inner vertex is further
-            # than the outer edge of the ring. This means the pixel is
-            # wholly outside the planet and the ring, hence its opacity
-            # value is zero.
-            value = 0.0
-
-        else:
-            # The pixel is partially covered by the planet and/or ring and
-            # so we must super-sample the pixel to estimate the appropriate
-            # opacity value for the pixel.
-            value = 0.0
-            for m in range(ssf):
-                for n in range(ssf):
-                    # central position of super sample pixel
-                    _xp = x_i + (0.5 + m) * ss_gap
-                    _yp = y_i + (0.5 + n) * ss_gap
-
-                    if (_xp ** 2 + _yp ** 2) ** 0.5 < 1.0:
-                        # the super sample pixel centre is on the planet
-                        value = value + ss_cont
-
-                    elif ((_xp / ir_maj) ** 2 + (_yp / ir_min) ** 2 >= 1 and
-                          (_xp / or_maj) ** 2 + (_yp / or_min) ** 2 < 1):
-                        # the super sample pixel centre is on the ring
-                        value = value + op * ss_cont
-
-        # send the value to the image pixel
-        image[i, j] = value

@@ -598,7 +598,7 @@ def _sum_lc_contrib(inarray, outarray):
     """
     i = cuda.grid(1)
     # quit if out of bounds
-    if i > inarray.shape[0]:
+    if i >= inarray.shape[0]:
         return
 
     # 1 - sum of all the elements in this row

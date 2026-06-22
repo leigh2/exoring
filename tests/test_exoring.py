@@ -14,7 +14,6 @@ def _fast_ring(**kwargs):
     """A small, coarse-grained ring for tests that don't need precision."""
     kwargs.setdefault("planet_scale", 50)
     kwargs.setdefault("img_array_shape", (128, 256))
-    kwargs.setdefault("super_sample_factor", 5)
     return ExoRing(**kwargs)
 
 

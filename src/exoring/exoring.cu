@@ -50,6 +50,27 @@ __device__ double warpShuffleSumd(double val) {
     return val;
 }
 
+// Signed distance from (x,y) to an axis-aligned ellipse (semi-axes maj, min_),
+// via the Sampson approximation F/|grad F| - exact for a circle, first-order
+// accurate for an ellipse when the curve's local radius of curvature is large
+// relative to a pixel (true here for every inclination down to gamma ~ 0.1-0.15
+// rad; only breaks down near the edge-on limit, which is an unmodelled
+// degenerate case anyway). Positive outside the ellipse, negative inside.
+__device__ inline float ellipse_signed_dist(float x, float y, float maj, float min_) {
+    float F = (x / maj) * (x / maj) + (y / min_) * (y / min_) - 1.0f;
+    float gx = 2.0f * x / (maj * maj);
+    float gy = 2.0f * y / (min_ * min_);
+    return F / sqrtf(gx * gx + gy * gy + 1e-30f);  // epsilon guards (0,0)
+}
+
+// Convert a signed distance to boundary-curve coverage via a one-pixel-wide
+// linear antialiasing ramp: fraction of the pixel lying on the inside
+// (dist<0) of the curve, saturating to 0/1 once the curve is more than half
+// a pixel away.
+__device__ inline float coverage_inside(float dist, float pixsize) {
+    return fminf(fmaxf(0.5f - dist / pixsize, 0.0f), 1.0f);
+}
+
 // build a planet-plus-ring opacity mask, single quadrant only (biaxial symmetry
 // is assumed and exploited by the caller)
 __global__ void fill_image(
@@ -61,10 +82,7 @@ __global__ void fill_image(
     const float ir_maj,     // major axis radius of ring inner edge
     const float or_min,     // minor axis radius of ring outer edge
     const float or_maj,     // major axis radius of ring outer edge
-    const float op,         // ring opacity
-    const int ssf,          // super sample factor
-    const float ss_gap,     // the size of a super-sample element in planetary radii
-    const float ss_cont     // the fractional contribution of a super sample element to its pixel
+    const float op          // ring opacity
 ){
     // j (column) is tied to the fastest-varying thread dimension so that
     // consecutive threads in a warp touch consecutive (coalesced) addresses
@@ -73,56 +91,26 @@ __global__ void fill_image(
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= rows || j >= cols) return;
 
-    // calculate the positions of the vertices of the pixel
-    float x_i = j * pixsize;        // x inner
-    float x_o = (j + 1) * pixsize;  // x outer
-    float y_i = i * pixsize;        // y inner
-    float y_o = (i + 1) * pixsize;  // y outer
-    // pixel inner and outer radii
-    float px_inner_rad = sqrtf(x_i * x_i + y_i * y_i);
-    float px_outer_rad = sqrtf(x_o * x_o + y_o * y_o);
+    // pixel centre
+    float xc = (j + 0.5f) * pixsize;
+    float yc = (i + 0.5f) * pixsize;
 
-    float value;
+    // signed distance to each boundary curve, planet edge first (exact,
+    // since the radial distance to a circle *is* the distance to its
+    // boundary), then the ring's inner/outer ellipses (Sampson approximation)
+    float dist_p = sqrtf(xc * xc + yc * yc) - 1.0f;
+    float dist_ir = ellipse_signed_dist(xc, yc, ir_maj, ir_min);
+    float dist_or = ellipse_signed_dist(xc, yc, or_maj, or_min);
 
-    if (px_outer_rad <= 1.0f) {
-        // the furthest vertex of the pixel is inside the planet radius, hence
-        // the pixel is fully inside the planet and the opacity is total
-        value = 1.0f;
+    // fraction of the pixel inside the planet, and inside the ring annulus
+    // (inside the outer ellipse and outside the inner one) - coverage_inside
+    // saturates to exactly 0/1 once a pixel is more than half a pixel-width
+    // from every curve, so this single expression also reproduces the old
+    // fully-interior/fully-exterior fast paths without any branching
+    float f_planet = coverage_inside(dist_p, pixsize);
+    float f_annulus = coverage_inside(dist_or, pixsize) * (1.0f - coverage_inside(dist_ir, pixsize));
 
-    } else if (px_inner_rad >= 1.0f &&
-               ((x_i / ir_maj) * (x_i / ir_maj) + (y_i / ir_min) * (y_i / ir_min) >= 1.0f &&
-                (x_o / or_maj) * (x_o / or_maj) + (y_o / or_min) * (y_o / or_min) <= 1.0f)) {
-        // the pixel is fully inside the ring but also fully outside the planet
-        value = op;
-
-    } else if (px_inner_rad >= 1.0f &&
-               ((x_o / ir_maj) * (x_o / ir_maj) + (y_o / ir_min) * (y_o / ir_min) <= 1.0f ||
-                (x_i / or_maj) * (x_i / or_maj) + (y_i / or_min) * (y_i / or_min) >= 1.0f)) {
-        // the pixel is wholly outside the planet and the ring
-        value = 0.0f;
-
-    } else {
-        // the pixel is partially covered by the planet and/or ring, super-sample
-        // it to estimate the appropriate opacity value
-        value = 0.0f;
-        for (int m = 0; m < ssf; m++) {
-            for (int n = 0; n < ssf; n++) {
-                float xp = x_i + (0.5f + m) * ss_gap;
-                float yp = y_i + (0.5f + n) * ss_gap;
-
-                if (sqrtf(xp * xp + yp * yp) < 1.0f) {
-                    // the super sample pixel centre is on the planet
-                    value += ss_cont;
-                } else if ((xp / ir_maj) * (xp / ir_maj) + (yp / ir_min) * (yp / ir_min) >= 1.0f &&
-                           (xp / or_maj) * (xp / or_maj) + (yp / or_min) * (yp / or_min) < 1.0f) {
-                    // the super sample pixel centre is on the ring
-                    value += op * ss_cont;
-                }
-            }
-        }
-    }
-
-    image[i * cols + j] = value;
+    image[i * cols + j] = f_planet + (1.0f - f_planet) * f_annulus * op;
 }
 
 // Blocked-intensity contribution of a single mirrored pixel position. Takes

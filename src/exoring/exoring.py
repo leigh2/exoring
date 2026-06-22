@@ -33,7 +33,7 @@ def _ensure_kernels():
     _fill_image_kernel = _cu_src.get_function("fill_image")
     _pixel_contrib_kernel = _cu_src.get_function("pixel_contrib_accumulate")
     _chisq_reduce_kernel = _cu_src.get_function("chisq_reduce")
-    _fill_image_kernel.prepare("Piiffffffiff")
+    _fill_image_kernel.prepare("Piiffffff")
     _pixel_contrib_kernel.prepare("PPiPiiffffffP")
     _chisq_reduce_kernel.prepare("PPPiP")
 
@@ -79,7 +79,6 @@ class ExoRing:
     def __init__(
             self,
             planet_scale=200,
-            super_sample_factor=10,
             img_array_shape=(512, 1024),
             imgen_block=(32, 32),
             lcgen_block=(16, 16),
@@ -93,11 +92,6 @@ class ExoRing:
         planet_scale : int, optional
             The number of image array elements per planet radius, this must fit
             within the first element of `img_array_shape`. (Default: 200.)
-        super_sample_factor : int, optional
-            Pixels which straddle the planet and/or ring boundary are
-            super-sampled to estimate the appropriate opacity.
-            `super_sample_factor` is the number of subdivisions along each
-            dimension. (Default: 10.)
         img_array_shape : tuple, optional
             Tuple of length 2, dictating the shape of the on-device image array
             in which to build the opacity images. (Default: (512, 1024).)
@@ -127,14 +121,6 @@ class ExoRing:
         self.planet_scale = planet_scale
         # pixel size, i.e. planetary radii per pixel
         self.pixel_size = 1.0 / planet_scale
-
-        # super_sample_factor is the number of subdivisions along each dimension
-        # in which to split each image array element when evaluating the mean
-        # opacity of an element which spans a ring or planet edge
-        self.super_sample_factor = super_sample_factor
-        fssf = float(self.super_sample_factor)
-        self.ss_gap = self.pixel_size / fssf
-        self.ss_cont = fssf ** -2
 
         # opacity image array, on the device
         self.img_array_shape = img_array_shape
@@ -274,9 +260,7 @@ class ExoRing:
             np.float32(self.pixel_size),
             np.float32(i_r_min), np.float32(inner_ring_radius),
             np.float32(o_r_min), np.float32(outer_ring_radius),
-            np.float32(ring_opacity),
-            np.int32(self.super_sample_factor),
-            np.float32(self.ss_gap), np.float32(self.ss_cont)
+            np.float32(ring_opacity)
         )
 
     def read_image(self, return_full=True):

@@ -208,6 +208,154 @@ def test_get_loglikelihood_without_observed_flux_raises():
         ring.get_loglikelihood()
 
 
+# ---------------------------------------------------------------------------
+# put_times_array / compute_xy_array — orbital (x,y) generation via on-device
+# Kepler solver, cross-checked against an independent host-side reference
+# ---------------------------------------------------------------------------
+
+def _host_kepler_xy(times, t0, period, a, inc, ecc, w):
+    """Pure-numpy/host reference implementation of the get_xy CUDA kernel
+    (exoring.cu), used to independently verify the on-device Kepler solver
+    rather than just checking self-consistency."""
+    times = np.asarray(times, dtype=np.float64)
+    n = 2.0 * np.pi / period
+    f0 = 0.5 * np.pi - w
+
+    if ecc < 1.0e-5:
+        m0 = f0
+    else:
+        e0 = 2.0 * np.arctan(
+            np.sqrt((1.0 - ecc) / (1.0 + ecc)) * np.tan(0.5 * f0)
+        )
+        m0 = e0 - ecc * np.sin(e0)
+
+    tp = t0 - 0.5 * period * m0 / np.pi
+
+    if ecc < 1.0e-5:
+        f = np.mod((times - tp) / period, 1.0) * 2.0 * np.pi
+    else:
+        m = n * (times - tp)
+        e = m.copy()
+        for _ in range(100):
+            e = e - (e - ecc * np.sin(e) - m) / (1.0 - ecc * np.cos(e))
+        f = 2.0 * np.arctan(
+            np.sqrt((1.0 + ecc) / (1.0 - ecc)) * np.tan(0.5 * e)
+        )
+
+    r = a * (1.0 - ecc ** 2) / (1.0 + ecc * np.cos(f))
+    x = -r * np.cos(w + f)
+    y = -r * np.sin(w + f) * np.cos(inc)
+    return x, y
+
+
+def test_compute_xy_array_circular_matches_host_reference():
+    ring = _fast_ring()
+    times = np.linspace(0.0, 30.0, LC_SIZE)
+    ring.put_times_array(times)
+    orbit_params = dict(t0=5.0, period=10.0, a=15.0, inc=1.4, ecc=0.0, w=0.0)
+    ring.compute_xy_array(**orbit_params)
+
+    x = ring.x_array.get()
+    y = ring.y_array.get()
+    x_exp, y_exp = _host_kepler_xy(times, **orbit_params)
+
+    assert np.allclose(x, x_exp, atol=1e-6)
+    assert np.allclose(y, y_exp, atol=1e-6)
+
+
+def test_compute_xy_array_eccentric_matches_host_reference():
+    ring = _fast_ring()
+    times = np.linspace(0.0, 30.0, LC_SIZE)
+    ring.put_times_array(times)
+    orbit_params = dict(t0=5.0, period=10.0, a=15.0, inc=1.4, ecc=0.4, w=0.7)
+    ring.compute_xy_array(**orbit_params)
+
+    x = ring.x_array.get()
+    y = ring.y_array.get()
+    x_exp, y_exp = _host_kepler_xy(times, **orbit_params)
+
+    assert np.allclose(x, x_exp, atol=1e-6)
+    assert np.allclose(y, y_exp, atol=1e-6)
+
+
+def test_compute_xy_array_circular_matches_analytic_formula():
+    """For ecc=0, w=0 the Kepler solve reduces to plain uniform circular
+    motion - cross-check against that closed-form expression directly,
+    independent of the general get_xy algorithm."""
+    ring = _fast_ring()
+    t0, period, a, inc = 5.0, 10.0, 15.0, 1.0
+    times = np.linspace(0.0, 30.0, LC_SIZE)
+    ring.put_times_array(times)
+    ring.compute_xy_array(t0=t0, period=period, a=a, inc=inc, ecc=0.0, w=0.0)
+
+    x = ring.x_array.get()
+    y = ring.y_array.get()
+
+    phase = 2.0 * np.pi * (times - t0) / period
+    x_exp = a * np.sin(phase)
+    y_exp = -a * np.cos(phase) * np.cos(inc)
+
+    assert np.allclose(x, x_exp, atol=1e-6)
+    assert np.allclose(y, y_exp, atol=1e-6)
+
+
+def test_compute_xy_array_mid_transit_impact_parameter():
+    """At inferior conjunction (t=t0) for a circular orbit, the planet should
+    sit at the orbit's impact parameter b = a*cos(inc), with x = 0."""
+    ring = _fast_ring()
+    t0, period, a, inc = 3.0, 10.0, 12.0, 1.2
+    times = np.array([t0])
+    ring.put_times_array(times)
+    ring.compute_xy_array(t0=t0, period=period, a=a, inc=inc, ecc=0.0, w=0.0)
+
+    x = ring.x_array.get()
+    y = ring.y_array.get()
+
+    assert abs(x[0]) < 1e-6
+    assert abs(y[0] - (-a * np.cos(inc))) < 1e-6
+
+
+def test_compute_xy_array_periodicity():
+    ring = _fast_ring()
+    t0, period, a, inc = 2.0, 7.0, 10.0, 1.3
+    times = np.array([1.0, 1.0 + period, 1.0 + 3 * period])
+    ring.put_times_array(times)
+    ring.compute_xy_array(t0=t0, period=period, a=a, inc=inc, ecc=0.2, w=0.5)
+
+    x = ring.x_array.get()
+    y = ring.y_array.get()
+
+    assert np.allclose(x, x[0], atol=1e-6)
+    assert np.allclose(y, y[0], atol=1e-6)
+
+
+def test_compute_xy_array_without_times_raises():
+    ring = _fast_ring()
+    with pytest.raises(RuntimeError):
+        ring.compute_xy_array(
+            t0=0.0, period=10.0, a=10.0, inc=1.5, ecc=0.0, w=0.0
+        )
+
+
+def test_orbital_position_feeds_transit_light_curve():
+    """End-to-end: orbital elements -> on-device (x,y) -> opacity image ->
+    light curve, producing a transit dip centred near t0."""
+    ring = _build(_fast_ring())
+    t0, period, a, inc = 5.0, 20.0, 10.0, 1.55  # near edge-on, low impact param
+    times = np.linspace(t0 - 1.0, t0 + 1.0, LC_SIZE)
+    ring.put_times_array(times)
+    ring.compute_xy_array(t0=t0, period=period, a=a, inc=inc, ecc=0.0, w=0.0)
+    ring.occult_star(planet_radius=0.1, obliquity=0.0, ld_params=(0.4, 0.3))
+    lc = ring.read_lightcurve()
+
+    assert np.all(lc >= 0.0 - 1e-6)
+    assert np.all(lc <= 1.0 + 1e-6)
+    # mid-transit point should be dimmer than the baseline at the ends
+    mid_idx = LC_SIZE // 2
+    assert lc[mid_idx] < lc[0]
+    assert lc[mid_idx] < lc[-1]
+
+
 def test_light_curve_size_not_multiple_of_block_size():
     """Regression test for an off-by-one in the light curve reduction kernel
     that overran by one row whenever the light curve size wasn't an exact

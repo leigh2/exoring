@@ -7,6 +7,7 @@ from pycuda.compiler import SourceModule
 from pycuda import gpuarray
 
 _cu_src = None
+_get_xy_kernel = None
 _fill_image_kernel = None
 _pixel_contrib_kernel = None
 _chisq_reduce_kernel = None
@@ -21,6 +22,7 @@ def _ensure_kernels():
     each re-running nvcc.
     """
     global _cu_src
+    global _get_xy_kernel
     global _fill_image_kernel, _pixel_contrib_kernel, _chisq_reduce_kernel
     if _cu_src is not None:
         return
@@ -30,9 +32,11 @@ def _ensure_kernels():
         _cu_src = SourceModule(
             cu_src_file.read(), options=["-use_fast_math", "-O3"]
         )
+    _get_xy_kernel = _cu_src.get_function("get_xy")
     _fill_image_kernel = _cu_src.get_function("fill_image")
     _pixel_contrib_kernel = _cu_src.get_function("pixel_contrib_accumulate")
     _chisq_reduce_kernel = _cu_src.get_function("chisq_reduce")
+    _get_xy_kernel.prepare("PPPddddddi")
     _fill_image_kernel.prepare("Piiffffff")
     _pixel_contrib_kernel.prepare("PPiPiiffffffP")
     _chisq_reduce_kernel.prepare("PPPiP")
@@ -82,7 +86,8 @@ class ExoRing:
             img_array_shape=(512, 1024),
             imgen_block=(32, 32),
             lcgen_block=(16, 16),
-            lcsum_block=1024
+            lcsum_block=1024,
+            xygen_block=256
     ):
         """
         Initialise the exoring light curve generation class instance
@@ -106,6 +111,9 @@ class ExoRing:
         lcsum_block : int, optional
             CUDA threads-per-block for the chi-square reduction kernel.
             (Default: 1024.)
+        xygen_block : int, optional
+            CUDA threads-per-block for the orbital position (Kepler solver)
+            kernel - one thread per light curve point. (Default: 256.)
         """
         _ensure_kernels()
 
@@ -156,7 +164,11 @@ class ExoRing:
         n_warps_lcsum = (lcsum_block + 31) // 32
         self._lcsum_smem = n_warps_lcsum * 8  # bytes (float64 per warp)
 
+        # get_xy launch configuration
+        self.xygen_block = int(xygen_block)
+
         # initialise some instance variables
+        self.times_array = None
         self.x_array = None
         self.y_array = None
         self.n_pts = None
@@ -165,14 +177,20 @@ class ExoRing:
         self.lc_accum = None
         self._chisq = None
 
-        # blocks per grid for the lc reduction kernel, set once the light
-        # curve size is known (see put_xy_array)
+        # blocks per grid for the lc reduction and orbital position kernels,
+        # set once the light curve size is known (see put_xy_array /
+        # put_times_array)
         self.lcsum_grid = None
+        self.xygen_grid = None
 
     def put_xy_array(self, xarray, yarray):
         """
-        Send the on-sky planet position relative to the star position to the
-        device.
+        Send a precomputed on-sky planet position trajectory relative to the
+        star position to the device. Use this when the (x,y) trajectory is
+        computed externally (e.g. in tests); for fitting orbital parameters
+        in an MCMC loop, use `put_times_array` once and `compute_xy_array`
+        per step instead, so the trajectory is computed on-device from
+        orbital elements without a host round-trip.
 
         Parameters
         ----------
@@ -195,6 +213,72 @@ class ExoRing:
         # construction time - see __init__ - since it no longer depends on
         # the light curve size)
         self.lcsum_grid = (ceil(self.n_pts / self.lcsum_block), 1, 1)
+
+    def put_times_array(self, times):
+        """
+        Send the light curve observation times to the device once, and
+        allocate the on-device (x,y) planet position buffers that
+        `compute_xy_array` fills in on every subsequent call. Use this
+        (instead of `put_xy_array`) when fitting orbital parameters, so the
+        time series is uploaded only once per run while the planet's sky
+        position is recomputed on-device from orbital elements at every MCMC
+        step.
+
+        Parameters
+        ----------
+        times : ndarray
+            1D Numpy array of (N,) light curve observation time points.
+        """
+        # input verification
+        assert len(times.shape) == 1
+
+        self.times_array = to_gpu(times, np.float64)
+        self.n_pts = times.size
+        self.x_array = gpuarray.zeros(self.n_pts, dtype=np.float64)
+        self.y_array = gpuarray.zeros(self.n_pts, dtype=np.float64)
+
+        # blocks per grid for the lc reduction and orbital position kernels
+        # (lcgen_grid is fixed at construction time - see __init__ - since it
+        # no longer depends on the light curve size)
+        self.lcsum_grid = (ceil(self.n_pts / self.lcsum_block), 1, 1)
+        self.xygen_grid = (ceil(self.n_pts / self.xygen_block), 1, 1)
+
+    def compute_xy_array(self, t0, period, a, inc, ecc, w):
+        """
+        Solve Kepler's equation on the device to (re)compute the planet's
+        on-sky (x,y) position relative to the star, given a set of orbital
+        elements. `put_times_array` must have been called first. This is a
+        hot-path call, intended to be repeated every MCMC step as orbital
+        parameters vary, same as `build_image` for ring geometry.
+
+        Parameters
+        ----------
+        t0 : float
+            Time of inferior conjunction.
+        period : float
+            Orbital period.
+        a : float
+            Semi-major axis, in units of stellar radii.
+        inc : float
+            Orbital inclination, in radians.
+        ecc : float
+            Orbital eccentricity.
+        w : float
+            Longitude of periastron, in radians.
+        """
+        if self.times_array is None:
+            raise RuntimeError(
+                "Can't compute orbital positions - call put_times_array first"
+            )
+
+        _get_xy_kernel.prepared_call(
+            self.xygen_grid, (self.xygen_block, 1, 1),
+            self.times_array.gpudata, self.x_array.gpudata,
+            self.y_array.gpudata,
+            np.float64(t0), np.float64(period), np.float64(a),
+            np.float64(inc), np.float64(ecc), np.float64(w),
+            np.int32(self.n_pts)
+        )
 
     def put_observed_lc(self, flux, flux_error):
         """

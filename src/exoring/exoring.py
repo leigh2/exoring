@@ -96,7 +96,10 @@ class ExoRing:
         ----------
         planet_scale : int, optional
             The number of image array elements per planet radius, this must fit
-            within the first element of `img_array_shape`. (Default: 200.)
+            within the first element of `img_array_shape`. (Default: 200,
+            which gives a model flux error better than 1ppm relative to a
+            converged (planet_scale=800) reference - see
+            scripts/precision_grid_size.py.)
         img_array_shape : tuple, optional
             Tuple of length 2, dictating the shape of the on-device image array
             in which to build the opacity images. (Default: (512, 1024).)
@@ -331,9 +334,26 @@ class ExoRing:
         singamma = sin(gamma % (0.5 * pi))
 
         # verify that the ring fits in the device image array
-        assert self.planet_scale * outer_ring_radius <= self.img_array_shape[1]
-        assert self.planet_scale * outer_ring_radius * singamma \
-               < self.img_array_shape[0]
+        if self.planet_scale * outer_ring_radius > self.img_array_shape[1]:
+            raise ValueError(
+                f"outer_ring_radius={outer_ring_radius} (planet radii) "
+                f"exceeds the image array's column extent of "
+                f"{self.img_array_shape[1] / self.planet_scale} planet "
+                f"radii (img_array_shape[1]={self.img_array_shape[1]}, "
+                f"planet_scale={self.planet_scale})"
+            )
+        if self.planet_scale * outer_ring_radius * singamma \
+                >= self.img_array_shape[0]:
+            raise ValueError(
+                f"outer_ring_radius={outer_ring_radius} (planet radii) at "
+                f"gamma={gamma} rad (sin(gamma)={singamma:.4g}) projects to "
+                f"a minor-axis extent of "
+                f"{outer_ring_radius * singamma} planet radii, which "
+                f"exceeds the image array's row extent of "
+                f"{self.img_array_shape[0] / self.planet_scale} planet "
+                f"radii (img_array_shape[0]={self.img_array_shape[0]}, "
+                f"planet_scale={self.planet_scale})"
+            )
 
         # convert normal optical depth to opacity
         if singamma != 0:

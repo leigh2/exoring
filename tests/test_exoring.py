@@ -81,7 +81,7 @@ def test_image_edge_on_wider():
 
 def test_build_image_ring_too_large_raises():
     ring = _fast_ring()
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         ring.build_image(inner_ring_radius=1.5, outer_ring_radius=10.0,
                           ring_optical_depth=1.0, gamma=0.5)
 

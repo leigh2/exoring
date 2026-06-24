@@ -344,9 +344,12 @@ __global__ void pixel_contrib_accumulate(
 // single chisq scalar via one atomicAdd per block. Fuses what used to be two
 // separate kernels (per-block chisq reduction + final atomic-sum reduction).
 __global__ void chisq_reduce(
-    const double * lc_accum,    // (n_pts,) light curve accumulator (model = 1 - lc_accum)
-    const double * flux,         // (n_pts,) observed flux
-    const double * flux_error,    // (n_pts,) observed flux error
+    const double * lc_accum,      // (n_pts,) light curve accumulator (model = 1 - lc_accum)
+    const float * offset_flux,    // (n_pts,) observed flux, pre-converted to the same
+                                   // 0-baseline form as lc_accum (offset_flux = 1 - flux).
+                                   // float32 here is fine since these are depth-scale
+                                   // values, not near-1.0 ones - promoted to double below
+    const float * flux_error,     // (n_pts,) observed flux error
     const int n_pts,                // number of light curve points
     double * chisq                  // single-element output (to be atomically filled)
 ){
@@ -354,8 +357,7 @@ __global__ void chisq_reduce(
 
     double val = 0.0;
     if (k < n_pts) {
-        double model = 1.0 - lc_accum[k];
-        double resid = (flux[k] - model) / flux_error[k];
+        double resid = ((double) offset_flux[k] - lc_accum[k]) / (double) flux_error[k];
         val = resid * resid;
     }
 

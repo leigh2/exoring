@@ -172,7 +172,7 @@ class ExoRing:
         self.x_array = None
         self.y_array = None
         self.n_pts = None
-        self.flux = None
+        self.offset_flux = None
         self.flux_error = None
         self.lc_accum = None
         self._chisq = None
@@ -297,9 +297,16 @@ class ExoRing:
         # input verification
         assert flux.shape == flux_error.shape
         assert len(flux.shape) == 1
-        # send arrays to device
-        self.flux = to_gpu(flux, np.float64)
-        self.flux_error = to_gpu(flux_error, np.float64)
+        # send arrays to device, pre-converted to the same 0-baseline form as
+        # lc_accum (model = 1.0 - lc_accum) so chisq_reduce doesn't have to
+        # redo this subtraction on every get_loglikelihood call. float32 is
+        # used here (chisq_reduce promotes to double before the lc_accum
+        # comparison) since offset_flux/flux_error are depth-scale values,
+        # not near-1.0 ones - float32's relative precision there is well
+        # below the 1ppm floor set by planet_scale - see
+        # scripts/test_offset_flux_float32_precision.py
+        self.offset_flux = to_gpu(1.0 - flux, np.float32)
+        self.flux_error = to_gpu(flux_error, np.float32)
 
     def build_image(self,
                     inner_ring_radius, outer_ring_radius,
@@ -469,7 +476,7 @@ class ExoRing:
             raise RuntimeError(
                 "model lightcurve array is empty, can't compute log likelihood"
             )
-        elif self.flux is None:
+        elif self.offset_flux is None:
             raise RuntimeError(
                 "fluxes not provided, can't compute log likelihood"
             )
@@ -483,7 +490,7 @@ class ExoRing:
             _chisq_reduce_kernel.prepared_call(
                 self.lcsum_grid, (self.lcsum_block, 1, 1),
                 self.lc_accum.gpudata,
-                self.flux.gpudata, self.flux_error.gpudata,
+                self.offset_flux.gpudata, self.flux_error.gpudata,
                 np.int32(self.n_pts), self._chisq.gpudata,
                 shared_size=self._lcsum_smem
             )

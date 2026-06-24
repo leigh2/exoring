@@ -18,7 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Three kernels backing ExoRing (see exoring.py):
+// Four kernels backing ExoRing (see exoring.py):
+//   get_xy                   - solves Kepler's equation to turn orbital
+//                              elements into an on-sky (x,y) planet trajectory
 //   fill_image               - builds the opacity mask for a planet+ring system
 //   pixel_contrib_accumulate - projects the opacity mask onto a star to build
 //                              a model light curve
@@ -26,7 +28,8 @@
 //                              one
 //
 // Units: build_image / fill_image work in units of planetary radii.
-// pixel_contrib_accumulate / chisq_reduce work in units of stellar radii.
+// get_xy / pixel_contrib_accumulate / chisq_reduce work in units of stellar
+// radii.
 //
 // Quadrant symmetry: the opacity image only ever holds a single quadrant
 // (planet+ring is biaxially symmetric), so pixel_contrib_accumulate mirrors
@@ -48,6 +51,90 @@ __device__ double warpShuffleSumd(double val) {
         val += __shfl_down_sync(0xffffffff, val, offset);
     }
     return val;
+}
+
+// Newton-Raphson solve of Kepler's equation E - e*sin(E) = M for the
+// eccentric anomaly E, given the mean anomaly M and eccentricity e (see
+// Murray & Correia, in Seager's "Exoplanets", section 3, eqn. 5). Ported
+// unchanged from the old gpu_transit_toolkit project's get_ds kernel.
+__device__ double getE(double M, double e)
+{
+    double E = M, eps = 1.0e-7;
+    double fe, fs;
+
+    while (fmod(fabs(E - e * sin(E) - M), 2.0 * M_PI) > eps)
+    {
+        fe = fmod(E - e * sin(E) - M, 2.0 * M_PI);
+        fs = fmod(1 - e * cos(E), 2.0 * M_PI);
+        E = E - fe / fs;
+    }
+    return E;
+}
+
+// Solve for the planet's on-sky (x,y) position relative to the star centre,
+// in units of stellar radii, at every light curve time point, given a set of
+// orbital elements. One thread per light curve point - O(n_pts) Newton
+// iterations to solve Kepler's equation, negligible next to
+// pixel_contrib_accumulate's O(pixels x n_pts) cost. This is a port of
+// gpu_transit_toolkit's get_ds kernel, extended to emit the sky-plane (x,y)
+// decomposition (batman/rsky.c convention: X along the transit-chord
+// direction, Y along the impact-parameter direction) instead of just the
+// scalar center-to-center separation - exoring's ring projection needs the
+// planet's sky-plane direction relative to the ring's tilt axis, not just
+// |separation|.
+__global__ void get_xy(
+    const double * __restrict__ times,  // (n_pts,) light curve observation times
+    double * x_array,                    // (n_pts,) output: planet 'X' position
+    double * y_array,                    // (n_pts,) output: planet 'Y' position
+    const double t0,                      // time of inferior conjunction
+    const double per,                      // orbital period
+    const double a,                         // semi-major axis, in stellar radii
+    const double inc,                        // orbital inclination, radians
+    const double ecc,                         // eccentricity
+    const double w,                            // longitude of periastron, radians
+    const int n_pts                             // number of light curve points
+){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_pts) return;
+
+    double t = times[idx];
+
+    double n = 2.0 * M_PI / per;
+    double f = 0.5 * M_PI - w;
+
+    double E;
+    double M;
+
+    // the true (f), eccentric (E) and mean (M) anomaly are all equal for a
+    // circular orbit
+    if (ecc < 1.0e-5)
+    {
+        M = f;
+    }
+    else
+    {
+        E = 2.0 * atan(sqrt((1.0 - ecc) / (1.0 + ecc)) * tan(0.5 * f));
+        M = E - ecc * sin(E);
+    }
+
+    // time of periastron
+    double tp = t0 - 0.5 * per * M / M_PI;
+
+    if (ecc < 1.0e-5)
+    {
+        f = fmod((t - tp) / per, 1.0) * 2.0 * M_PI;
+    }
+    else
+    {
+        M = n * (t - tp);
+        E = getE(M, ecc);
+        f = 2.0 * atan(sqrt((1.0 + ecc) / (1.0 - ecc)) * tan(0.5 * E));
+    }
+
+    double r = a * (1.0 - ecc * ecc) / (1.0 + ecc * cos(f));
+
+    x_array[idx] = -r * cos(w + f);
+    y_array[idx] = -r * sin(w + f) * cos(inc);
 }
 
 // Signed distance from (x,y) to an axis-aligned ellipse (semi-axes maj, min_),

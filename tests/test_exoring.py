@@ -171,13 +171,15 @@ def _ring_with_lightcurve():
     return ring
 
 
-def test_loglikelihood_perfect_fit_is_zero():
+def test_loglikelihood_perfect_fit_is_normalisation_only():
     ring = _ring_with_lightcurve()
     lc = ring.read_lightcurve()
-    ring.put_observed_lc(lc.astype(np.float32),
-                         np.full_like(lc, 1e-4, dtype=np.float32))
+    flux_error = np.full_like(lc, 1e-4, dtype=np.float32)
+    ring.put_observed_lc(lc.astype(np.float32), flux_error)
     ll = ring.get_loglikelihood()
-    assert abs(ll) < 1e-3
+
+    expected_ll = -0.5 * np.sum(np.log(2 * np.pi * flux_error.astype(np.float64) ** 2))
+    assert abs(ll - expected_ll) < 1e-2 * abs(expected_ll)
 
 
 def test_loglikelihood_matches_numpy_chisq():
@@ -192,7 +194,27 @@ def test_loglikelihood_matches_numpy_chisq():
     ll = ring.get_loglikelihood()
 
     expected_chisq = np.sum(((flux - lc) / flux_error) ** 2)
-    expected_ll = -0.5 * expected_chisq
+    expected_norm = np.sum(np.log(2 * np.pi * flux_error.astype(np.float64) ** 2))
+    expected_ll = -0.5 * (expected_chisq + expected_norm)
+    assert abs(ll - expected_ll) < 1e-2 * abs(expected_ll)
+
+
+def test_loglikelihood_jitter_inflates_error():
+    ring = _ring_with_lightcurve()
+    lc = ring.read_lightcurve()
+
+    rng = np.random.default_rng(0)
+    flux = (lc + rng.normal(0, 1e-3, size=lc.shape)).astype(np.float32)
+    flux_error = np.full_like(flux, 1e-3, dtype=np.float32)
+    ring.put_observed_lc(flux, flux_error)
+
+    jitter = 5e-3
+    ll = ring.get_loglikelihood(jitter=jitter)
+
+    sigma_eff2 = flux_error.astype(np.float64) ** 2 + jitter ** 2
+    expected_chisq = np.sum(((flux - lc) ** 2) / sigma_eff2)
+    expected_norm = np.sum(np.log(2 * np.pi * sigma_eff2))
+    expected_ll = -0.5 * (expected_chisq + expected_norm)
     assert abs(ll - expected_ll) < 1e-2 * abs(expected_ll)
 
 

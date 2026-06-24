@@ -340,9 +340,24 @@ __global__ void pixel_contrib_accumulate(
     }
 }
 
-// Reduce (flux - model)^2 / error^2 over all light curve points straight into a
-// single chisq scalar via one atomicAdd per block. Fuses what used to be two
-// separate kernels (per-block chisq reduction + final atomic-sum reduction).
+// Reduce -2*log(likelihood) (a Gaussian residual term plus its normalisation,
+// per point) over all light curve points straight into a single scalar via
+// one atomicAdd per block. Fuses what used to be two separate kernels
+// (per-block reduction + final atomic-sum reduction).
+//
+// jitter is an optional error-inflation term (e.g. an MCMC-fitted parameter
+// covering unmodelled excess scatter): sigma_eff^2 = flux_error^2 + jitter^2.
+// Folding the per-point normalisation log(2*pi*sigma_eff^2) into this kernel
+// (rather than computing sum(log(...)) host-side every step in Python/numpy)
+// matters once flux_error varies with a fitted jitter, since the
+// normalisation no longer cancels between MCMC steps and must be
+// recomputed every time get_loglikelihood is called. Doing that recompute
+// here instead of on the host avoids an O(n_pts) numpy reduction every
+// step, which (e.g. PLATO's ~2.5M-point light curves) can rival the cost
+// of the whole GPU pipeline; this kernel's own O(n_pts) cost is already
+// negligible next to pixel_contrib_accumulate's O(pixels x n_pts), and the
+// extra log() per point doesn't change that ratio - see
+// scripts/benchmark_jitter_loglikelihood.py.
 __global__ void chisq_reduce(
     const double * lc_accum,      // (n_pts,) light curve accumulator (model = 1 - lc_accum)
     const float * offset_flux,    // (n_pts,) observed flux, pre-converted to the same
@@ -350,6 +365,7 @@ __global__ void chisq_reduce(
                                    // float32 here is fine since these are depth-scale
                                    // values, not near-1.0 ones - promoted to double below
     const float * flux_error,     // (n_pts,) observed flux error
+    const double jitter,            // error-inflation term, in the same units as flux_error
     const int n_pts,                // number of light curve points
     double * chisq                  // single-element output (to be atomically filled)
 ){
@@ -357,8 +373,10 @@ __global__ void chisq_reduce(
 
     double val = 0.0;
     if (k < n_pts) {
-        double resid = ((double) offset_flux[k] - lc_accum[k]) / (double) flux_error[k];
-        val = resid * resid;
+        double sigma_eff2 = (double) flux_error[k] * (double) flux_error[k]
+                             + jitter * jitter;
+        double resid = ((double) offset_flux[k] - lc_accum[k]) / sqrt(sigma_eff2);
+        val = resid * resid + log(2.0 * M_PI * sigma_eff2);
     }
 
     val = warpShuffleSumd(val);

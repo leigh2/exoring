@@ -39,7 +39,7 @@ def _ensure_kernels():
     _get_xy_kernel.prepare("PPPddddddi")
     _fill_image_kernel.prepare("Piiffffff")
     _pixel_contrib_kernel.prepare("PPiPiiffffffP")
-    _chisq_reduce_kernel.prepare("PPPiP")
+    _chisq_reduce_kernel.prepare("PPPdiP")
 
 
 def to_gpu(arr, dtype):
@@ -483,10 +483,22 @@ class ExoRing:
         else:
             return 1.0 - self.lc_accum.get()
 
-    def get_loglikelihood(self):
+    def get_loglikelihood(self, jitter=0.0):
         """
-        Compute the log-likelihood of the lightcurve data given a set of model
+        Compute the full Gaussian log-likelihood (residual term plus its
+        per-point normalisation) of the lightcurve data given a set of model
         parameters.
+
+        Parameters
+        ----------
+        jitter : float, optional
+            Optional error-inflation term, in the same units as the
+            `flux_error` passed to `put_observed_lc`, added in quadrature:
+            `sigma_eff^2 = flux_error^2 + jitter^2`. Pass this as a fitted
+            MCMC parameter to model unaccounted-for excess scatter; the
+            normalisation term has to be recomputed on the device every call
+            in that case, since it no longer cancels between steps once it
+            depends on a varying parameter. (Default: 0.0, i.e. no inflation.)
 
         Returns
         -------
@@ -511,7 +523,7 @@ class ExoRing:
                 self.lcsum_grid, (self.lcsum_block, 1, 1),
                 self.lc_accum.gpudata,
                 self.offset_flux.gpudata, self.flux_error.gpudata,
-                np.int32(self.n_pts), self._chisq.gpudata,
+                np.float64(jitter), np.int32(self.n_pts), self._chisq.gpudata,
                 shared_size=self._lcsum_smem
             )
 

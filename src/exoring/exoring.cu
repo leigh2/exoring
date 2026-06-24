@@ -84,8 +84,10 @@ __device__ double getE(double M, double e)
 // |separation|.
 __global__ void get_xy(
     const double * __restrict__ times,  // (n_pts,) light curve observation times
-    double * x_array,                    // (n_pts,) output: planet 'X' position
-    double * y_array,                    // (n_pts,) output: planet 'Y' position
+    float * x_array,                     // (n_pts,) output: planet 'X' position. float32
+                                          // is enough here - pixel_contrib_accumulate
+                                          // immediately truncates these to float anyway
+    float * y_array,                     // (n_pts,) output: planet 'Y' position
     const double t0,                      // time of inferior conjunction
     const double per,                      // orbital period
     const double a,                         // semi-major axis, in stellar radii
@@ -133,8 +135,8 @@ __global__ void get_xy(
 
     double r = a * (1.0 - ecc * ecc) / (1.0 + ecc * cos(f));
 
-    x_array[idx] = -r * cos(w + f);
-    y_array[idx] = -r * sin(w + f) * cos(inc);
+    x_array[idx] = (float) (-r * cos(w + f));
+    y_array[idx] = (float) (-r * sin(w + f) * cos(inc));
 }
 
 // Signed distance from (x,y) to an axis-aligned ellipse (semi-axes maj, min_),
@@ -236,8 +238,8 @@ __device__ inline float mirrored_point_contribution(
 // contribution + light curve sum reduction) and avoids ever materialising a
 // (n_pts, num_blocks) intermediate array.
 __global__ void pixel_contrib_accumulate(
-    const double * xa,      // 'X' position of the planet centre relative to the star, per lc point
-    const double * ya,      // 'Y' position of the planet centre relative to the star, per lc point
+    const float * xa,       // 'X' position of the planet centre relative to the star, per lc point
+    const float * ya,       // 'Y' position of the planet centre relative to the star, per lc point
     const int n_pts,         // number of light curve points
     const float * image,    // opacity image (single quadrant, rows x cols, row-major)
     const int rows,           // number of rows in the image array
@@ -300,8 +302,8 @@ __global__ void pixel_contrib_accumulate(
             // math below (this is a photometric integral, not a precision-critical
             // sum) - keeping it out of double precision halves the register cost
             // of every temporary here
-            float x_off = (float) xa[k];
-            float y_off = (float) ya[k];
+            float x_off = xa[k];
+            float y_off = ya[k];
 
             double intensity_sum = 0.0;
             intensity_sum += mirrored_point_contribution(

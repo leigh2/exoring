@@ -204,9 +204,11 @@ class ExoRing:
         # input verification
         assert xarray.shape == yarray.shape
         assert len(xarray.shape) == 1
-        # send arrays to device
-        self.x_array = to_gpu(xarray, np.float64)
-        self.y_array = to_gpu(yarray, np.float64)
+        # send arrays to device. float32 is enough here - pixel_contrib_accumulate
+        # immediately truncates these to float anyway, so this loses no
+        # precision versus float64 while halving the bytes read in its hot loop
+        self.x_array = to_gpu(xarray, np.float32)
+        self.y_array = to_gpu(yarray, np.float32)
         self.n_pts = xarray.size
 
         # blocks per grid for the lc reduction kernel (lcgen_grid is fixed at
@@ -234,8 +236,8 @@ class ExoRing:
 
         self.times_array = to_gpu(times, np.float64)
         self.n_pts = times.size
-        self.x_array = gpuarray.zeros(self.n_pts, dtype=np.float64)
-        self.y_array = gpuarray.zeros(self.n_pts, dtype=np.float64)
+        self.x_array = gpuarray.zeros(self.n_pts, dtype=np.float32)
+        self.y_array = gpuarray.zeros(self.n_pts, dtype=np.float32)
 
         # blocks per grid for the lc reduction and orbital position kernels
         # (lcgen_grid is fixed at construction time - see __init__ - since it
